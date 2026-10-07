@@ -193,6 +193,10 @@ fn static_candidates(path: &str) -> Option<Vec<String>> {
         .collect::<Vec<_>>()
         .join("/");
 
+    if super::tasks::task_page(&format!("/{clean}")).is_some() {
+        return Some(vec!["task.html".to_owned()]);
+    }
+
     if clean.is_empty() {
         return Some(vec!["index.html".to_string()]);
     }

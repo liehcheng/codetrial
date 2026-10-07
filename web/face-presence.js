@@ -25,17 +25,50 @@ export function faceAssetUrl(file, baseUrl = FACE_VENDOR_BASE) {
   return `${baseUrl}${file}`;
 }
 
+// The most confident face's box and keypoints, in frame-relative units, for
+// the task workspace's look-away rule; null when there is no face or the
+// detector gives no geometry. Nothing else about the face is kept.
+export function faceGeometry(detections, score) {
+  let best = null;
+  for (const detection of detections) {
+    if (!best || score(detection) > score(best)) best = detection;
+  }
+  const box = best?.boundingBox;
+  if (!box || !Number.isFinite(box.xCenter) || !Number.isFinite(box.height))
+    return null;
+  const landmarks = Array.isArray(best.landmarks)
+    ? best.landmarks
+        .filter(
+          (point) => Number.isFinite(point?.x) && Number.isFinite(point?.y),
+        )
+        .map((point) => [point.x, point.y])
+    : [];
+  return {
+    box: [box.xCenter, box.yCenter, box.width, box.height],
+    landmarks,
+  };
+}
+
+// The twin of `normalize` in `face-worker.js`; change both together.
 export function normalizeFaceResults(results = {}) {
   const detections = Array.isArray(results.detections)
     ? results.detections
     : [];
-  const confidence = detections.reduce((best, detection) => {
-    const score = Array.isArray(detection.score)
+  const score = (detection) => {
+    const value = Array.isArray(detection.score)
       ? detection.score[0]
       : detection.score;
-    return Math.max(best, Number.isFinite(score) ? score : 0);
-  }, 0);
-  return { count: detections.length, confidence };
+    return Number.isFinite(value) ? value : 0;
+  };
+  const confidence = detections.reduce(
+    (best, detection) => Math.max(best, score(detection)),
+    0,
+  );
+  return {
+    count: detections.length,
+    confidence,
+    face: faceGeometry(detections, score),
+  };
 }
 
 /// Whether the preflight camera step may pass, given one detector sample.
@@ -148,10 +181,13 @@ export async function createFacePresenceDetector({
   loadScript = defaultLoadScript,
   baseUrl = FACE_VENDOR_BASE,
   Detector = null,
+  // `false` skips the browser's own detector, which reports a count but no
+  // face geometry.
+  native = true,
 } = {}) {
   try {
     const NativeFaceDetector = scope.FaceDetector;
-    if (!Detector && typeof NativeFaceDetector === "function") {
+    if (!Detector && native && typeof NativeFaceDetector === "function") {
       const detector = new NativeFaceDetector({ fastMode: true });
       return {
         available: true,
@@ -239,6 +275,7 @@ function createWorkerFaceDetector(scope) {
             available: true,
             count: result.count,
             confidence: result.confidence,
+            face: result.face ?? null,
           }
         : FACE_SAMPLE_UNAVAILABLE,
     );

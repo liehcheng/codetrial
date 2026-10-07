@@ -290,3 +290,20 @@ Checks that need credentials or a running service stay out of the gate and are
 run on their own: `scripts/server-check.sh`, `gemini-check.sh`,
 `parity-check.sh`, `report-parity-check.sh`, `visual-parity-check.sh`,
 `recording-integration.sh`, and `recording-provision-check.sh`.
+
+## Instructor task packaging
+
+The default credential-free gate requires the task packaging dependency.
+The instructor tool and its acceptance tests use the pinned Python dependency
+in `scripts/requirements-task.txt`. Install it in a virtual environment and
+run the gate with that interpreter:
+
+```sh
+python3 -m venv target/task-tools
+target/task-tools/bin/pip install -r scripts/requirements-task.txt
+PYTHON=target/task-tools/bin/python ./scripts/test.sh
+```
+
+`python scripts/task-package.py --help` lists validate, render-prompt, preview,
+build and publish-scan; [task-mode.md](task-mode.md#instructor-workflow) says
+what each does. The tooling never uploads or pushes files.

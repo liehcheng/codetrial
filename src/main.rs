@@ -279,6 +279,7 @@ fn web_server_config(
     recording_can_deliver(recording.as_ref())?;
 
     Ok(WebServerConfig {
+        tasks: None,
         web_dir: PathBuf::from(value_or(values, "CODETRIAL_WEB_DIR", DEFAULT_WEB_DIR)),
         github_client_id: nonempty(values, "GITHUB_CLIENT_ID"),
         github_client_secret: nonempty(values, "GITHUB_CLIENT_SECRET"),
@@ -327,7 +328,7 @@ fn run_web(options: CliOptions) -> Result<(), String> {
     let production = is_production(&values);
     let pool = web_provider_pool(&values, &options, production)?;
 
-    let config = web_server_config(&values, pool, production, &options)?;
+    let mut config = web_server_config(&values, pool, production, &options)?;
 
     initialize_accounts(&config)?;
 
@@ -361,6 +362,16 @@ fn run_web(options: CliOptions) -> Result<(), String> {
     }
     // Same reason `serve_setup` prints this: say where to go.
     println!("codetrial: open http://{bound} in your browser");
+
+    // Task mode serves the learner at this machine and nobody else: it holds
+    // decrypted reference solutions in memory and trusts its page to report the
+    // test rules. Reachable from anywhere else, or set up to record or to share
+    // one fixed room, its routes say why they are off. A declared proxy makes a
+    // loopback bind as public as any other.
+    config.tasks = (reachable_from_elsewhere(&values, bound).is_none()
+        && config.fixed_room_name.is_none()
+        && config.recording.is_none())
+    .then(codetrial::tasks::access::TaskService::new);
 
     // Past every startup check, so whatever a previous run left in the log is
     // no longer true. Written on failure and removed on none, the file outlives

@@ -14,6 +14,47 @@ const EDITOR: ReportMaterial<'static> = ReportMaterial {
 };
 
 #[tokio::test]
+async fn task_feedback_exhausts_repairs_without_reusing_rejected_provider_content() {
+    let session =
+        crate::tasks::session::TaskSession::new(crate::tasks::test_support::admitted().await, 100);
+    let observed = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let captured = Arc::clone(&observed);
+    let app = axum::Router::new().route("/", axum::routing::post(move |axum::Json(request): axum::Json<Value>| {
+        let captured = Arc::clone(&captured);
+        async move {
+            captured.lock().unwrap().push(request);
+            axum::Json(json!({"candidates":[{"content":{"parts":[{"text":"{\"hire\":true,\"private\":\"REJECTED_PROVIDER_IMPLEMENTATION\"}"}]}}]}))
+        }
+    }));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let keys =
+        GeminiKeys::from_config(&live_config(&[("GOOGLE_API_KEYS", "task-repair-test-key")]));
+    assert!(
+        generate_task_feedback_at(
+            &keys,
+            &url,
+            &session,
+            "private reference",
+            "task-repair-room"
+        )
+        .await
+        .is_none()
+    );
+    let observed = observed.lock().unwrap();
+    assert_eq!(observed.len(), 1 + MAX_REPORT_REPAIRS);
+    assert!(observed.iter().all(|request| {
+        !request
+            .to_string()
+            .contains("REJECTED_PROVIDER_IMPLEMENTATION")
+    }));
+    server.abort();
+}
+
+#[tokio::test]
 async fn interim_failures_update_shared_cooldowns_without_retrying() {
     for status in [429, 401, 503, 400] {
         let first = format!("interim-{status}-first");
