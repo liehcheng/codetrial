@@ -368,9 +368,11 @@ fn run_web(options: CliOptions) -> Result<(), String> {
     // test rules. Reachable from anywhere else, or set up to record or to share
     // one fixed room, its routes say why they are off. A declared proxy makes a
     // loopback bind as public as any other.
-    config.tasks = (reachable_from_elsewhere(&values, bound).is_none()
-        && config.fixed_room_name.is_none()
-        && config.recording.is_none())
+    config.tasks = task_mode_allowed(
+        reachable_from_elsewhere(&values, bound),
+        config.fixed_room_name.is_some(),
+        config.recording.is_some(),
+    )
     .then(codetrial::tasks::access::TaskService::new);
 
     // Past every startup check, so whatever a previous run left in the log is
@@ -1089,6 +1091,10 @@ fn reachable_from_elsewhere(
     } else {
         None
     }
+}
+
+fn task_mode_allowed(reachable: Option<Reachable>, fixed_room: bool, recording: bool) -> bool {
+    reachable.is_none() && !fixed_room && !recording
 }
 
 fn published_secret_refusal(

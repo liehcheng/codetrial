@@ -42,12 +42,48 @@ fn a_python_built_package_opens_with_its_pin_and_nothing_else() {
         open("classroom", 7, &fixture.manifest, &corrupt, PIN),
         Err(OpenError::Invalid(_))
     ));
+
+    // Refused by the manifest, before a key derived for the wrong set or
+    // version could fail to decrypt it anyway.
     for (set, version) in [("other", 7), ("classroom", 8)] {
-        assert!(matches!(
-            open(set, version, &fixture.manifest, &fixture.ciphertext, PIN),
-            Err(OpenError::Invalid(_))
-        ));
+        assert_eq!(
+            open(set, version, &fixture.manifest, &fixture.ciphertext, PIN).err(),
+            Some(OpenError::Invalid(invalid(
+                "invalid manifest or ciphertext"
+            )))
+        );
     }
+}
+
+#[test]
+fn a_manifest_may_fill_its_size_limit_and_no_more() {
+    let fixture = fixture();
+    let padded = |size: usize| {
+        let mut manifest = fixture.manifest.clone();
+        manifest.resize(size, b' ');
+        manifest
+    };
+    assert!(
+        open_package(
+            "classroom",
+            7,
+            &padded(MAX_MANIFEST_BYTES),
+            fixture.ciphertext.clone(),
+            PIN
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        open_package(
+            "classroom",
+            7,
+            &padded(MAX_MANIFEST_BYTES + 1),
+            fixture.ciphertext.clone(),
+            PIN
+        )
+        .err(),
+        Some(OpenError::Invalid(invalid("manifest exceeds size limit")))
+    );
 }
 
 #[test]
@@ -81,6 +117,9 @@ fn a_site_is_an_https_base_that_sets_join_under() {
     for bad in [
         "http://teacher.github.io/course",
         "https://user:pw@teacher.github.io",
+        // Either half of a credential alone is still one.
+        "https://user@teacher.github.io",
+        "https://:pw@teacher.github.io",
         "https://teacher.github.io/course?x=1",
         "https://teacher.github.io/course#top",
         "teacher.github.io",
@@ -92,12 +131,35 @@ fn a_site_is_an_https_base_that_sets_join_under() {
     // The packaging tool writes whole seconds only; both sides take one form.
     assert!(parse_close("2026-10-06T12:00:00.5Z").is_err());
     assert!(parse_close("2026-02-31T12:00:00Z").is_err());
+
+    // RFC 3339 also takes these, at the length of the one form; the tool writes
+    // neither, so neither is read.
+    for other in [
+        "2026-10-06t12:00:00Z",
+        "2026-10-06 12:00:00Z",
+        "2026-10-06T12:00:00z",
+    ] {
+        assert_eq!(
+            parse_close(other).unwrap_err().0,
+            "close date must be UTC to the second",
+            "{other}"
+        );
+    }
 }
 
 /// Serves fixed responses by path until dropped, with the `Date` header a
 /// static host sends.
 async fn routed_fixture(
     routes: Vec<(&'static str, u16, Vec<u8>, Option<String>)>,
+) -> (reqwest::Url, tokio::task::JoinHandle<()>) {
+    routed_fixture_sized(routes, true).await
+}
+
+/// `routed_fixture`, optionally sending each body with no declared length,
+/// ended by closing the connection, as a host streaming a response may.
+async fn routed_fixture_sized(
+    routes: Vec<(&'static str, u16, Vec<u8>, Option<String>)>,
+    sized: bool,
 ) -> (reqwest::Url, tokio::task::JoinHandle<()>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -123,9 +185,13 @@ async fn routed_fixture(
             let location = location
                 .map(|value| format!("Location: {value}\r\n"))
                 .unwrap_or_default();
+            let length = if sized {
+                format!("Content-Length: {}\r\n", body.len())
+            } else {
+                String::new()
+            };
             let header = format!(
-                "HTTP/1.1 {status} fixture\r\nContent-Length: {}\r\nDate: Tue, 06 Oct 2026 12:00:00 GMT\r\nConnection: close\r\n{location}\r\n",
-                body.len()
+                "HTTP/1.1 {status} fixture\r\n{length}Date: Tue, 06 Oct 2026 12:00:00 GMT\r\nConnection: close\r\n{location}\r\n"
             );
             let _ = stream.write_all(header.as_bytes()).await;
             let _ = stream.write_all(&body).await;
@@ -147,7 +213,12 @@ async fn a_download_takes_the_versioned_files_and_the_site_clock_and_refuses_the
     };
     let fetched = |routes| async move {
         let (site, server) = routed_fixture(routes).await;
-        let downloaded = download(&site, "classroom", 7).await;
+        let downloaded = download(&Assignment {
+            site,
+            set_id: "classroom".to_owned(),
+            version: 7,
+        })
+        .await;
         server.abort();
         downloaded
     };
@@ -171,16 +242,46 @@ async fn a_download_takes_the_versioned_files_and_the_site_clock_and_refuses_the
         (MANIFEST, 200, vec![b' '; MAX_MANIFEST_BYTES + 1], None),
         (CIPHER, 200, fixture.ciphertext.clone(), None),
     ];
-    for (name, routes) in [
-        ("redirect", redirect),
-        ("404", missing),
-        ("oversize", oversize),
-    ] {
+    for (name, routes) in [("redirect", redirect), ("404", missing)] {
         assert!(fetched(routes).await.is_err(), "{name} downloaded");
     }
-    let (site, server) = routed_fixture(valid()).await;
-    assert!(download(&site, "../etc", 7).await.is_err());
-    server.abort();
+    // Refused on its declared length, before a byte of the body is read.
+    assert_eq!(
+        fetched(oversize).await.err(),
+        Some(invalid("package response refused"))
+    );
+    // A manifest may fill its limit exactly.
+    let mut full = fixture.manifest.clone();
+    full.resize(MAX_MANIFEST_BYTES, b' ');
+    let at_limit = vec![
+        (MANIFEST, 200, full.clone(), None),
+        (CIPHER, 200, fixture.ciphertext.clone(), None),
+    ];
+    assert_eq!(fetched(at_limit).await.unwrap().manifest, full);
+
+    // Without a declared length the limit is applied as the body arrives.
+    let streamed = |manifest: Vec<u8>| async {
+        let routes = vec![
+            (MANIFEST, 200, manifest, None),
+            (CIPHER, 200, fixture.ciphertext.clone(), None),
+        ];
+        let (site, server) = routed_fixture_sized(routes, false).await;
+        let downloaded = download(&Assignment {
+            site,
+            set_id: "classroom".to_owned(),
+            version: 7,
+        })
+        .await;
+        server.abort();
+        downloaded
+    };
+    assert_eq!(streamed(full.clone()).await.unwrap().manifest, full);
+    let mut over = full.clone();
+    over.push(b' ');
+    assert_eq!(
+        streamed(over).await.err(),
+        Some(invalid("package response exceeds limit"))
+    );
 }
 
 /// The fixture set as the packaging tool encrypts it: two tasks, default
@@ -344,4 +445,58 @@ fn one_task_may_not_outgrow_its_byte_limit() {
         decoded(&padded).err().unwrap().0,
         "plaintext task exceeds limit"
     );
+}
+
+/// Each manifest rule on its own, with the rest of the manifest made to agree:
+/// a wrong PIN is what a ciphertext that passes them all and still fails to
+/// decrypt reports, so passing a check shows as `WrongPin` and failing one
+/// as `Invalid`.
+#[test]
+fn each_manifest_rule_refuses_on_its_own() {
+    let fixture = fixture();
+    let refused = || {
+        Some(OpenError::Invalid(invalid(
+            "invalid manifest or ciphertext",
+        )))
+    };
+    let open = |patch: &dyn Fn(&mut Value), ciphertext: Vec<u8>| {
+        let mut manifest: Value = serde_json::from_slice(&fixture.manifest).unwrap();
+        manifest["ciphertextBytes"] = json!(ciphertext.len());
+        manifest["ciphertextSha256"] = json!(crate::sha256_hex(&[&ciphertext]));
+        patch(&mut manifest);
+        open_package(
+            "classroom",
+            7,
+            &serde_json::to_vec(&manifest).unwrap(),
+            ciphertext,
+            PIN,
+        )
+        .err()
+    };
+    let keep = |_: &mut Value| {};
+    assert_eq!(open(&keep, fixture.ciphertext.clone()), None);
+    assert_eq!(
+        open(
+            &|manifest| manifest["salt"] = json!("AAAAAAAAAAAAAAAAAAAA"),
+            fixture.ciphertext.clone()
+        ),
+        refused()
+    );
+    assert_eq!(
+        open(
+            &|manifest| manifest["ciphertextBytes"] = json!(fixture.ciphertext.len() + 1),
+            fixture.ciphertext.clone()
+        ),
+        refused()
+    );
+    // A ciphertext holds a nonce and a tag around at most `setBytes`.
+    let largest = default_number("setBytes") as usize + 28;
+    for (size, expected) in [
+        (27, refused()),
+        (28, Some(OpenError::WrongPin)),
+        (largest, Some(OpenError::WrongPin)),
+        (largest + 1, refused()),
+    ] {
+        assert_eq!(open(&keep, vec![7; size]), expected, "{size}");
+    }
 }

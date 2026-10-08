@@ -10,7 +10,7 @@ use super::{TaskError, bounded_text, invalid};
 /// Evidence references per dimension, and gaps or next actions per review.
 const MAX_REVIEW_ROWS: usize = 8;
 
-const DIMENSIONS: [&str; 4] = [
+pub(crate) const DIMENSIONS: [&str; 4] = [
     "reasoningParticipation",
     "implementationOwnership",
     "testingAndDiagnosis",

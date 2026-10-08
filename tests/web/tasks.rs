@@ -322,9 +322,12 @@ async fn task_admission_needs_the_rules_and_calibration_replays_one_room_and_tak
             "rules_unacknowledged",
         ),
         ("calibration", Value::Null, "calibration_required"),
+        // Each limit on its own: a short value that is no object, and an object
+        // past the size limit.
+        ("calibration", json!("calibrated"), "calibration_required"),
         (
             "calibration",
-            json!("x".repeat(5000)),
+            json!({"ok": true, "note": "x".repeat(5000)}),
             "calibration_required",
         ),
     ] {
@@ -458,9 +461,14 @@ async fn an_unlocked_set_is_account_bound_in_memory_and_gone_after_a_restart() {
 
 #[tokio::test]
 async fn device_sign_in_is_offered_only_where_task_mode_is_on() {
-    for task_mode in [false, true] {
-        let (mut config, _, db) = signed_in_web_config(&format!("task-device-{task_mode}"));
-        config.github_client_id = Some("public-client-id".to_owned());
+    for (task_mode, client_id) in [
+        (false, "public-client-id"),
+        (true, "public-client-id"),
+        (true, " "),
+    ] {
+        let (mut config, _, db) =
+            signed_in_web_config(&format!("task-device-{task_mode}-{}", client_id.len()));
+        config.github_client_id = Some(client_id.to_owned());
         config.tasks = task_mode.then(TaskService::new);
         let (url, server) = spawn_web_server(config).await;
         let client = http_client();
@@ -472,7 +480,8 @@ async fn device_sign_in_is_offered_only_where_task_mode_is_on() {
             .json::<Value>()
             .await
             .unwrap();
-        assert_eq!(session["deviceLogin"], task_mode);
+        // A blank id is no app to sign in with (test builds carry none).
+        assert_eq!(session["deviceLogin"], task_mode && client_id != " ");
         if !task_mode {
             // A device code from a server others can reach is a phishing lure.
             let start = client
@@ -557,8 +566,9 @@ async fn only_the_canonical_assignment_path_is_a_task_page() {
         .unwrap();
     assert_eq!(page.status(), 200);
     assert!(page.text().await.unwrap().contains("task.js"));
-    // The page reads its set and task from the path as sent, so a doubled
-    // slash it would misread is not served as the task page.
+
+    // The page reads its set and task from the path as sent, so a doubled slash
+    // it would misread is not served as the task page.
     let doubled = client
         .get(format!("{url}/t//classroom/delimiter-closer"))
         .send()
@@ -568,6 +578,201 @@ async fn only_the_canonical_assignment_path_is_a_task_page() {
         .await
         .unwrap();
     assert!(!doubled.contains("task.js"), "{doubled}");
+    server.shutdown().await;
+    remove_database(db).await;
+}
+
+/// GitHub's half of the device flow: one device code, and each poll answered
+/// with the next of `answers`. The profile endpoint answers only the token a
+/// poll issued, so a sign-in that never polled cannot pass.
+async fn spawn_device_github(answers: Vec<Value>) -> (String, TestServer) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let answers = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+        answers,
+    )));
+    let router = axum::Router::new()
+        .route(
+            "/login/device/code",
+            axum::routing::post(|| async {
+                axum::Json(json!({"device_code": "device-1", "user_code": "ABCD-1234",
+                    "verification_uri": "https://github.com/login/device", "interval": 5,
+                    "expires_in": 900}))
+            }),
+        )
+        .route(
+            "/login/oauth/access_token",
+            axum::routing::post(move |body: String| {
+                let answers = answers.clone();
+                async move {
+                    let posted: Value = serde_json::from_str(&body).unwrap();
+                    assert_eq!(posted["device_code"], "device-1");
+                    assert_eq!(posted["client_id"], "public-client-id");
+                    assert_eq!(
+                        posted["grant_type"],
+                        "urn:ietf:params:oauth:grant-type:device_code"
+                    );
+                    axum::Json(answers.lock().unwrap().pop_front().unwrap())
+                }
+            }),
+        )
+        .route(
+            "/user",
+            axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                if headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    != Some("Bearer device-token")
+                {
+                    return (axum::http::StatusCode::UNAUTHORIZED, axum::Json(json!({})));
+                }
+                (
+                    axum::http::StatusCode::OK,
+                    axum::Json(json!({"id": 404, "login": "learner", "avatar_url": null})),
+                )
+            }),
+        );
+    let server = spawn_test_server(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    );
+    (format!("http://{addr}"), server)
+}
+
+#[tokio::test]
+async fn a_device_sign_in_waits_while_pending_and_signs_in_once_approved() {
+    let (github, github_server) = spawn_device_github(vec![
+        json!({"error": "authorization_pending"}),
+        json!({"error": "slow_down", "interval": 15}),
+        json!({"error": "access_denied"}),
+        json!({"access_token": "device-token"}),
+    ])
+    .await;
+    let (mut config, _, db) = signed_in_web_config("task-device-poll");
+    config.github_client_id = Some("public-client-id".to_owned());
+    config.github_oauth_base_url = Some(github.clone());
+    config.github_api_base_url = Some(github);
+    config.tasks = Some(TaskService::new());
+    let (url, server) = spawn_web_server(config).await;
+    let client = http_client();
+    let post = |path: &str, cookie: Option<&str>| {
+        let request = client
+            .post(format!("{url}{path}"))
+            .header("x-codetrial-task-request", "1");
+        match cookie {
+            Some(cookie) => request.header("Cookie", cookie),
+            None => request,
+        }
+    };
+
+    // Without the device cookie there is nothing to poll for.
+    let orphan = post("/api/github/device/poll", None).send().await.unwrap();
+    assert_eq!(orphan.status(), 400);
+    assert_eq!(orphan.json::<Value>().await.unwrap()["restart"], true);
+
+    let start = post("/api/github/device", None).send().await.unwrap();
+    assert_eq!(start.status(), 200);
+    let device = start.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let shown = start.json::<Value>().await.unwrap();
+    assert_eq!(shown["userCode"], "ABCD-1234");
+
+    let poll = || async {
+        let response = post("/api/github/device/poll", Some(&device))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let cookies: Vec<String> = response
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .map(|value| value.to_str().unwrap().to_owned())
+            .collect();
+        (status, response.json::<Value>().await.unwrap(), cookies)
+    };
+    let (status, body, _) = poll().await;
+    assert_eq!((status, body), (202, json!({"pending": true})));
+    let (status, body, _) = poll().await;
+    assert_eq!(
+        (status, body),
+        (202, json!({"pending": true, "interval": 15}))
+    );
+    let (status, body, _) = poll().await;
+    assert_eq!(status, 400);
+    assert_eq!(body["restart"], true);
+    let (status, body, cookies) = poll().await;
+    assert_eq!((status, body), (200, json!({"signedIn": true})));
+    let session = cookies
+        .iter()
+        .find(|cookie| !cookie.starts_with(device.split('=').next().unwrap()))
+        .expect("a session cookie")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let signed_in = client
+        .get(format!("{url}/api/session"))
+        .header("Cookie", &session)
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(signed_in["user"]["login"], "learner");
+
+    server.shutdown().await;
+    github_server.shutdown().await;
+    remove_database(db).await;
+}
+
+/// Only "not signed in" becomes the task error that offers a sign-in. A
+/// session that cannot be read is a server fault, and telling the learner to
+/// sign in again would send them round a loop that cannot end.
+#[tokio::test]
+async fn only_a_missing_session_is_answered_as_a_sign_in() {
+    let (mut config, cookie, db) = signed_in_web_config("task-owner-fault");
+    config.tasks = Some(TaskService::new());
+    let (url, server) = spawn_web_server(config).await;
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch("DROP TABLE sessions")
+        .unwrap();
+    let response = http_client()
+        .get(format!(
+            "{url}/api/task-sets/classroom/tasks/delimiter-closer?site=https%3A%2F%2Fteacher.github.io%2Fcourse&version=7"
+        ))
+        .header("Cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 500);
+    assert_ne!(
+        response.json::<Value>().await.unwrap()["code"],
+        "authentication_required"
+    );
+    server.shutdown().await;
+    remove_database(db).await;
+}
+
+#[tokio::test]
+async fn a_signed_in_learner_with_no_attempt_in_a_room_has_no_result_there() {
+    let (mut config, cookie, db) = signed_in_web_config("task-no-result");
+    config.tasks = Some(TaskService::new());
+    let (url, server) = spawn_web_server(config).await;
+    let response = http_client()
+        .get(format!("{url}/api/task-reviews/room-1"))
+        .header("Cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(code(response).await, (404, "result_unavailable".to_owned()));
     server.shutdown().await;
     remove_database(db).await;
 }

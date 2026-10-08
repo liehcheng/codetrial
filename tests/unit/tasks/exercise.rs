@@ -142,7 +142,10 @@ fn task_prompt_recovers_custom_instructions_and_substitutes_once() {
             .task_prompt(Phase::Work, Some("missing"), "")
             .is_err()
     );
-    assert!(interpolate("{{{title}}{", &BTreeMap::from([("title", "sample")])).is_ok());
+    assert_eq!(
+        interpolate("a{{{title}}{", &BTreeMap::from([("title", "sample")])).unwrap(),
+        "a{sample{"
+    );
     assert!(interpolate("}} {{title}}", &BTreeMap::from([("title", "sample")])).is_err());
 }
 
@@ -312,4 +315,367 @@ fn task_ids_may_start_with_a_digit_but_not_a_dash() {
     for bad in ["", "-x", "Upper", "under_score", &"a".repeat(65)] {
         assert!(!crate::tasks::record_id(bad), "{bad}");
     }
+}
+
+#[test]
+fn the_accessors_read_the_named_check_and_the_private_notes() {
+    let mut data = fixture("customized");
+    data["problem"]["referenceCode"] = json!("def is_valid(s):\n    return True\n");
+    let exercise = Exercise(Arc::new(record(&data).unwrap()));
+    assert_eq!(
+        exercise.check_question("contract"),
+        Some("What must remain true as the loop advances?")
+    );
+    assert_eq!(exercise.check_question("missing"), None);
+    assert_eq!(
+        exercise.reference_code(),
+        Some("def is_valid(s):\n    return True\n")
+    );
+    let (optimal, pitfalls) = exercise.reference_notes();
+    assert!(optimal.starts_with("Single pass with a stack"), "{optimal}");
+    assert!(
+        pitfalls.starts_with("Popping from an empty stack"),
+        "{pitfalls}"
+    );
+
+    // A record without reference code says so rather than offering an empty
+    // one.
+    let plain = Exercise(Arc::new(record(&fixture("customized")).unwrap()));
+    assert_eq!(plain.reference_code(), None);
+}
+
+/// Each of these breaks exactly one rule a completion target or a check must
+/// keep, and the refusal names that rule. Breaking two at once would let a
+/// check that stopped working hide behind the other.
+#[test]
+fn each_target_and_check_rule_refuses_on_its_own() {
+    let base = fixture("customized");
+    let target = |patch: &dyn Fn(&mut Value)| {
+        let mut row = base.clone();
+        patch(&mut row);
+        record(&row).map(|_| ()).unwrap_err().0
+    };
+    let with_starter = |row: &mut Value, marker: &str| {
+        row["problem"]["starterCode"]["python"] = json!(format!(
+            "class Solution:\n    def isValid(self, s: str) -> bool:\n        # TASK_COMPLETE_CLOSER\n        # {marker}\n        return True\n"
+        ));
+    };
+    let second = |row: &mut Value, id: &str, marker: &str| {
+        let mut extra = row["sidecar"]["completionTargets"][0].clone();
+        extra["id"] = json!(id);
+        extra["marker"] = json!(marker);
+        row["sidecar"]["completionTargets"]
+            .as_array_mut()
+            .unwrap()
+            .push(extra);
+    };
+    let marker_error = "missing, invalid or duplicate completion marker";
+    let target_error = "invalid completion target";
+    let check_error = "invalid understanding check";
+
+    let long = format!("T{}", "A".repeat(128));
+    assert_eq!(
+        target(&|row| {
+            with_starter(row, &long);
+            second(row, "long", &long);
+        }),
+        marker_error
+    );
+    // One byte shorter is a marker like any other.
+    let longest = format!("T{}", "A".repeat(127));
+    let mut row = base.clone();
+    with_starter(&mut row, &longest);
+    second(&mut row, "longest", &longest);
+    assert!(record(&row).is_ok());
+
+    for bad in ["", "9LIVES", "TASK-X", "TASKx"] {
+        assert_eq!(
+            target(&|row| {
+                with_starter(row, bad);
+                second(row, "other", bad);
+            }),
+            marker_error,
+            "{bad:?}"
+        );
+    }
+    // The same marker under a second id: only the duplicate rule refuses it.
+    assert_eq!(
+        target(&|row| second(row, "again", "TASK_COMPLETE_CLOSER")),
+        marker_error
+    );
+    // A marker the starter does not carry.
+    assert_eq!(
+        target(&|row| second(row, "absent", "TASK_ABSENT")),
+        marker_error
+    );
+
+    assert_eq!(
+        target(&|row| {
+            with_starter(row, "TASK_OTHER");
+            second(row, "closer-branch", "TASK_OTHER");
+        }),
+        target_error
+    );
+    for (field, value) in [
+        ("id", json!("Bad Id")),
+        ("language", json!("javascript")),
+        ("goal", json!(" ")),
+        ("goal", json!("x".repeat(1025))),
+    ] {
+        assert_eq!(
+            target(&|row| row["sidecar"]["completionTargets"][0][field] = value.clone()),
+            target_error,
+            "{field}"
+        );
+    }
+
+    for (index, field, value) in [
+        (0, "id", json!("Bad Id")),
+        (1, "id", json!("trace")),
+        (2, "question", json!(" ")),
+        (2, "question", json!("x".repeat(1025))),
+    ] {
+        assert_eq!(
+            target(&|row| row["sidecar"]["understandingChecks"][index][field] = value.clone()),
+            check_error,
+            "{index} {field}"
+        );
+    }
+}
+
+#[test]
+fn identifiers_start_with_a_letter_and_hold_only_lowercase_digits_and_dashes() {
+    for good in ["a", "closer-branch", "trace2", &"a".repeat(64)] {
+        assert!(crate::tasks::identifier(good), "{good}");
+    }
+    for bad in ["", "2trace", "-x", "a_b", "aB", "a b", &"a".repeat(65)] {
+        assert!(!crate::tasks::identifier(bad), "{bad}");
+    }
+    // The message is what the page is shown, so it is the error's text.
+    assert_eq!(
+        TaskError("invalid task".to_owned()).to_string(),
+        "invalid task"
+    );
+}
+
+/// The bank's structural rules, one broken at a time and each named by its
+/// refusal, as `each_target_and_check_rule_refuses_on_its_own` does for the
+/// sidecar.
+#[test]
+fn each_bank_rule_refuses_on_its_own() {
+    let refused = |name: &str, patch: &dyn Fn(&mut Value)| {
+        let mut row = fixture(name);
+        patch(&mut row);
+        record(&row).map(|_| ()).err().map(|error| error.0)
+    };
+    let function = |patch: &dyn Fn(&mut Value)| refused("customized", patch);
+    let class = |patch: &dyn Fn(&mut Value)| refused("class-renamed-method", patch);
+    let text = Some("expected nonblank bank text".to_owned());
+    let identifier = Some("invalid identifier".to_owned());
+    let rename = Some("invalid variant entry rename".to_owned());
+    let lengths = Some("invalid class case lengths".to_owned());
+
+    assert_eq!(
+        function(&|row| row["problem"]["summary"] = json!(" ")),
+        text
+    );
+    assert_eq!(
+        function(&|row| row["problem"]["referenceCode"] = json!("")),
+        text
+    );
+
+    assert_eq!(
+        function(&|row| row["judge"]["paramNames"] = json!(["1s"])),
+        identifier
+    );
+    assert_eq!(
+        function(&|row| row["judge"]["paramNames"] = json!(["s-x"])),
+        identifier
+    );
+    assert_eq!(
+        function(&|row| row["judge"]["paramNames"] = json!(["s_x"])),
+        None
+    );
+
+    // An original problem carries neither an imported title nor examples.
+    let origin = Some("invalid problem origin".to_owned());
+    assert_eq!(
+        function(&|row| row["problem"]["title"] = json!("Valid Parentheses")),
+        origin
+    );
+    assert_eq!(
+        function(&|row| row["problem"]["examples"] = json!([])),
+        origin
+    );
+
+    // Only an argument type may be null, and only that.
+    assert_eq!(
+        function(&|row| row["judge"]["argTypes"] = json!([null, "string"])),
+        None
+    );
+    assert_eq!(
+        function(&|row| row["judge"]["argTypes"] = json!([" "])),
+        text
+    );
+    assert_eq!(
+        function(&|row| row["judge"]["paramTypes"] = json!([null])),
+        text
+    );
+
+    assert_eq!(
+        function(&|row| row["variant"]["className"] = json!("Audit")),
+        rename
+    );
+    assert_eq!(
+        function(&|row| row["judge"]["className"] = json!("Audit")),
+        rename
+    );
+    assert_eq!(
+        function(&|row| row["variant"]["entry"] = json!("IsVALID")),
+        rename
+    );
+    assert_eq!(
+        function(&|row| row["variant"]["entry"] = json!("DelimitersNest")),
+        rename
+    );
+    assert_eq!(
+        class(&|row| row["variant"]["className"] = json!("bidLedger")),
+        rename
+    );
+    assert_eq!(
+        class(&|row| row["variant"]["entry"] = json!("bidLedger")),
+        rename
+    );
+
+    // A term is a plain word on both sides; a parameter may keep its
+    // underscore.
+    let term = Some("invalid term rename".to_owned());
+    assert_eq!(
+        function(&|row| row["variant"]["terms"] = json!({"pair_s": "links"})),
+        term
+    );
+    assert_eq!(
+        function(&|row| row["variant"]["terms"] = json!({"pairs": "link_s"})),
+        term
+    );
+    assert_eq!(
+        function(&|row| row["variant"]["parameters"] = json!({"s": "text_in"})),
+        None
+    );
+
+    let cases = Some("invalid judge cases".to_owned());
+    assert_eq!(function(&|row| row["judge"]["cases"] = json!([])), cases);
+    assert_eq!(
+        function(&|row| {
+            let case = row["judge"]["cases"][0].clone();
+            row["judge"]["cases"] = Value::Array(vec![case; 1001]);
+        }),
+        cases
+    );
+
+    assert_eq!(
+        class(&|row| row["judge"]["cases"][0]["input"] = json!([[], []])),
+        lengths
+    );
+    assert_eq!(
+        class(&|row| {
+            row["judge"]["cases"][0]["input"][1]
+                .as_array_mut()
+                .unwrap()
+                .pop();
+        }),
+        lengths
+    );
+    assert_eq!(
+        class(&|row| {
+            row["judge"]["cases"][0]["expected"]
+                .as_array_mut()
+                .unwrap()
+                .pop();
+        }),
+        lengths
+    );
+    assert_eq!(
+        class(&|row| row["judge"]["cases"][0]["input"][0][0] = json!("MaxStack")),
+        lengths
+    );
+}
+
+#[test]
+fn a_starter_may_fill_the_code_limit_and_no_more() {
+    let limit = crate::tasks::session::MAX_CODE_BYTES;
+    let base = fixture("customized");
+    let raw = base["problem"]["starterCode"]["python"].as_str().unwrap();
+    // The limit is the posed starter's, which the variant's renames lengthen.
+    let posed = record(&base).unwrap().starters["python"].len() - raw.len();
+    let padded = |size: usize| {
+        let mut row = base.clone();
+        let mut starter = raw.to_owned();
+        starter.push('#');
+        starter.push_str(&"x".repeat(size - posed - starter.len()));
+        row["problem"]["starterCode"]["python"] = json!(starter);
+        record(&row).map(|_| ()).map_err(|error| error.0)
+    };
+    assert_eq!(padded(limit), Ok(()));
+    assert_eq!(
+        padded(limit + 1),
+        Err("starter exceeds the code byte limit".to_owned())
+    );
+}
+
+#[test]
+fn a_task_may_require_twenty_cases_and_no_more() {
+    let required = |count: usize| {
+        let mut row = fixture("customized");
+        let case = row["judge"]["cases"][0].clone();
+        let labels: Vec<String> = (0..count)
+            .map(|index| format!("required {index}"))
+            .collect();
+        for label in &labels {
+            let mut extra = case.clone();
+            extra["label"] = json!(label);
+            row["judge"]["cases"].as_array_mut().unwrap().push(extra);
+        }
+        row["sidecar"]["requiredCases"] = json!(labels);
+        record(&row).map(|_| ()).map_err(|error| error.0)
+    };
+    assert_eq!(required(20), Ok(()));
+    assert_eq!(required(21), Err("too many required cases".to_owned()));
+}
+
+#[test]
+fn a_task_may_mark_eight_targets_and_must_ask_the_core_checks() {
+    let targets = |count: usize| {
+        let mut row = fixture("customized");
+        let template = row["sidecar"]["completionTargets"][0].clone();
+        let mut starter = row["problem"]["starterCode"]["python"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut list = vec![template.clone()];
+        for index in 1..count {
+            let marker = format!("TASK_EXTRA_{index}");
+            starter.push_str(&format!("# {marker}\n"));
+            let mut target = template.clone();
+            target["id"] = json!(format!("extra-{index}"));
+            target["marker"] = json!(marker);
+            list.push(target);
+        }
+        row["problem"]["starterCode"]["python"] = json!(starter);
+        row["sidecar"]["completionTargets"] = json!(list);
+        record(&row).map(|_| ()).map_err(|error| error.0)
+    };
+    let count_error = Err("invalid target or check count".to_owned());
+    assert_eq!(targets(8), Ok(()));
+    assert_eq!(targets(9), count_error);
+
+    let mut row = fixture("customized");
+    row["sidecar"]["understandingChecks"]
+        .as_array_mut()
+        .unwrap()
+        .pop();
+    assert_eq!(
+        record(&row).map(|_| ()).map_err(|error| error.0),
+        count_error
+    );
 }

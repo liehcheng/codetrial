@@ -110,6 +110,20 @@ struct ActiveAttempt {
 }
 
 impl State {
+    /// Holds `unlocked` as the most recently opened set, letting the least
+    /// recent go past the cap. One is added at a time, so one is all that can
+    /// be over.
+    fn remember(&mut self, key: (i64, Assignment), unlocked: Unlocked) {
+        self.unlock_order.retain(|held| held != &key);
+        self.unlock_order.push_back(key.clone());
+        self.unlocked.insert(key, unlocked);
+        if self.unlock_order.len() > MAX_UNLOCKED_SETS
+            && let Some(oldest) = self.unlock_order.pop_front()
+        {
+            self.unlocked.remove(&oldest);
+        }
+    }
+
     /// Drops a kept result once its time is up, at whatever request comes
     /// next, so an expired review and its code are not held for the life of
     /// the process.
@@ -263,7 +277,7 @@ impl TaskService {
         if !super::package::valid_pin(pin) {
             return Err(AccessError::new("invalid_pin"));
         }
-        let downloaded = download(&assignment.site, &assignment.set_id, assignment.version)
+        let downloaded = download(assignment)
             .await
             .map_err(|_| AccessError::new("package_unavailable"))?;
         self.open(owner_id, assignment, downloaded, pin, now).await
@@ -305,16 +319,11 @@ impl TaskService {
         if set.config.closed(unlocked.now(now)) {
             return Err(AccessError::new("set_closed"));
         }
-        let key = (owner_id, assignment.clone());
-        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.unlock_order.retain(|held| held != &key);
-        state.unlock_order.push_back(key.clone());
-        state.unlocked.insert(key, unlocked);
-        while state.unlock_order.len() > MAX_UNLOCKED_SETS {
-            if let Some(oldest) = state.unlock_order.pop_front() {
-                state.unlocked.remove(&oldest);
-            }
-        }
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remember((owner_id, assignment.clone()), unlocked);
         Ok(json!({"setId": set_id, "version": version,
             "tasks": set.records.iter().map(|(id, record)| json!({"id": id, "title": Exercise(record.clone()).title()})).collect::<Vec<_>>()}))
     }
@@ -435,10 +444,11 @@ impl TaskService {
             },
         );
         state.admission_order.push_back(key);
-        while state.admission_order.len() > MAX_ADMISSIONS {
-            if let Some(oldest) = state.admission_order.pop_front() {
-                state.admissions.remove(&oldest);
-            }
+        // One is added at a time, so one is all that can be over.
+        if state.admission_order.len() > MAX_ADMISSIONS
+            && let Some(oldest) = state.admission_order.pop_front()
+        {
+            state.admissions.remove(&oldest);
         }
         Ok(Admission::New(PinnedTask {
             hint_limit: hint_limit(&set, &record),
@@ -525,10 +535,8 @@ impl TaskService {
     pub(crate) fn insert_unlocked(&self, owner_id: i64, site: &str, set: Arc<LoadedSet>) {
         let mut state = self.0.state.lock().unwrap();
         let assignment = Assignment::new(site, &set.config.id, set.config.version).unwrap();
-        let key = (owner_id, assignment);
-        state.unlock_order.push_back(key.clone());
-        state.unlocked.insert(
-            key,
+        state.remember(
+            (owner_id, assignment),
             Unlocked {
                 set,
                 site_clock: None,

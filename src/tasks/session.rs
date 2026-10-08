@@ -790,7 +790,10 @@ impl TaskSession {
         self.pending_run_revisions
             .retain(|_, expires_at| *expires_at > now);
         let deadline = self.deadline_at?;
-        if self.expire(now) || self.phase == Phase::Feedback {
+
+        // A finished attempt is neither Work nor wrap-up, so it falls through
+        // both branches below to nothing.
+        if self.expire(now) {
             return None;
         }
         if self.phase == Phase::Work

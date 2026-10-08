@@ -533,9 +533,12 @@ fn interpolate(prompt: &str, values: &BTreeMap<&str, &str>) -> Result<String, Ta
         if rest[at..].starts_with("{{{{") {
             return Err(invalid("malformed prompt variable"));
         }
+        // A third brace is literal text; the variable starts after it.
         if rest[at..].starts_with("{{{") {
-            output.push_str(&rest[..at + 1]);
-            rest = &rest[at + 1..];
+            let (text, brace) = rest.split_at(at);
+            output.push_str(text);
+            output.push('{');
+            rest = &brace[1..];
             continue;
         }
         output.push_str(&rest[..at]);

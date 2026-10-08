@@ -359,3 +359,101 @@ async fn a_hinted_turn_past_the_reference_cap_still_counts_as_supported() {
         "a turn after a hint was rated as independent"
     );
 }
+
+#[test]
+fn text_is_tokenized_into_words_and_single_punctuation() {
+    // Words keep their underscores; each mark is its own token; whitespace and
+    // the end of the text are none.
+    assert_eq!(
+        tokens("stack_top = pairs[c]\t+ 1"),
+        ["stack_top", "=", "pairs", "[", "c", "]", "+", "1"]
+    );
+    assert!(tokens(" \n").is_empty());
+}
+
+#[tokio::test]
+async fn a_testing_rating_cites_a_run_that_ran_tests() {
+    let mut session = session().await;
+    for (revision, run, passed, total, diagnostics) in [
+        ("tested", "ran", 1, 2, ""),
+        ("crashed", "broke", 0, 0, "SyntaxError: invalid syntax"),
+    ] {
+        let message: crate::tasks::session::RevisionMessage = serde_json::from_value(json!({
+            "version": 1, "requestId": format!("capture-{run}"), "revisionId": revision,
+            "code": format!("# {revision}"), "trigger": "run"}))
+        .unwrap();
+        session.revision(message, 111).unwrap();
+        let result: crate::tasks::session::RunMessage = serde_json::from_value(json!({
+            "version": 1, "requestId": format!("result-{run}"), "runId": run,
+            "revisionId": revision, "passed": passed, "total": total,
+            "diagnostics": diagnostics}))
+        .unwrap();
+        session.run(result, 112).unwrap();
+    }
+    let rated = |run: &str| {
+        let mut value = review();
+        let dimension = &mut value["dimensions"]["testingAndDiagnosis"];
+        dimension["rating"] = json!(3);
+        dimension["reason"] = json!("The learner ran the tests and read the failure.");
+        dimension["insufficientReason"] = Value::Null;
+        dimension["evidence"] =
+            json!([{"kind": "turn", "id": "turn-1"}, {"kind": "run", "id": run}]);
+        validate(&session, &value, "").map_err(|error| error.0)
+    };
+    assert_eq!(rated("ran"), Ok(()));
+    // A rating and a reason for having none contradict each other.
+    let mut value = review();
+    let dimension = &mut value["dimensions"]["reasoningParticipation"];
+    dimension["rating"] = json!(3);
+    dimension["evidence"] = json!([{"kind": "turn", "id": "turn-1"}]);
+    assert_eq!(
+        validate(&session, &value, "").map_err(|error| error.0),
+        Err("numeric rating needs reliable evidence".to_owned())
+    );
+    // A runner failure ran no test, so it is no evidence about testing.
+    assert_eq!(
+        rated("broke"),
+        Err("numeric rating needs reliable evidence".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn a_zero_cites_an_unresolved_check_and_a_two_names_its_support() {
+    let mut session = session().await;
+    session.observe_turn("turn-2", "I am not sure what the stack is for.", 111);
+    session
+        .record_check("contract", "unresolved", "initial", "turn-2")
+        .unwrap();
+    let rated = |session: &TaskSession, rating: u64, support: &str, turn: &str| {
+        let mut value = review();
+        let dimension = &mut value["dimensions"]["reasoningParticipation"];
+        dimension["rating"] = json!(rating);
+        dimension["reason"] = json!("What the learner said about the loop.");
+        dimension["insufficientReason"] = Value::Null;
+        dimension["support"] = json!(support);
+        dimension["evidence"] = json!([{"kind": "turn", "id": turn}]);
+        validate(session, &value, "").map_err(|error| error.0)
+    };
+    assert_eq!(rated(&session, 0, "none", "turn-2"), Ok(()));
+    // turn-1 covered its check, so it is no unresolved opportunity.
+    assert_eq!(
+        rated(&session, 0, "none", "turn-1"),
+        Err("zero needs an observed unresolved opportunity".to_owned())
+    );
+    // A two needs both the support named and the evidence bound to it.
+    assert_eq!(
+        rated(&session, 2, "conceptual_hint", "turn-1"),
+        Err("supported rating needs support provenance".to_owned())
+    );
+    session
+        .checks
+        .get_mut("trace")
+        .unwrap()
+        .turn_support
+        .insert("turn-1".to_owned(), Support::ConceptualHint);
+    assert_eq!(
+        rated(&session, 2, "none", "turn-1"),
+        Err("supported rating needs support provenance".to_owned())
+    );
+    assert_eq!(rated(&session, 2, "conceptual_hint", "turn-1"), Ok(()));
+}

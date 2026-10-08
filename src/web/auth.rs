@@ -309,16 +309,18 @@ pub(crate) async fn callback_handler(
 /// flow there and talks someone into approving it gets their session.
 fn device_client_id(config: &WebServerConfig) -> Option<String> {
     config.tasks.as_ref()?;
-    config
-        .github_client_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        // A release workflow without the variable sets it empty.
-        .or(option_env!("CODETRIAL_GITHUB_CLIENT_ID")
-            .map(str::trim)
-            .filter(|id| !id.is_empty()))
-        .map(str::to_owned)
+
+    // The configured id first, then the one a release build carries. Either may
+    // be blank: a release workflow without the variable compiles it in empty.
+    [
+        config.github_client_id.as_deref(),
+        option_env!("CODETRIAL_GITHUB_CLIENT_ID"),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|id| !id.is_empty())
+    .map(str::to_owned)
 }
 
 /// Starts a GitHub device authorization: the page shows the user code and

@@ -491,3 +491,7 @@ pub(crate) async fn task_start_handler(
     );
     json_response(StatusCode::OK, response)
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/web/tasks.rs"]
+mod tests;

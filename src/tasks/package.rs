@@ -11,7 +11,8 @@ use ring::{aead, pbkdf2};
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{TaskError, TaskRecord, default_number, identifier, invalid};
+use super::access::Assignment;
+use super::{TaskError, TaskRecord, default_number, invalid};
 
 /// Bytes of a set's manifest.
 const MAX_MANIFEST_BYTES: usize = 4096;
@@ -348,17 +349,16 @@ pub struct Download {
     pub site_time: Option<(u64, tokio::time::Instant)>,
 }
 
-/// Fetches one set version's manifest and ciphertext under `site`, bounded in
-/// size and time, refusing redirects. `site` comes from `site_base`, except in
-/// tests that serve packages over local HTTP.
-pub async fn download(
-    site: &reqwest::Url,
-    set_id: &str,
-    version: u32,
-) -> Result<Download, TaskError> {
-    if !identifier(set_id) || version == 0 || version > i32::MAX as u32 {
-        return Err(invalid("invalid set id or version"));
-    }
+/// Fetches one set version's manifest and ciphertext under the assignment's
+/// site, bounded in size and time, refusing redirects. `Assignment::new` has
+/// checked the id and version that name the path, and the site is from
+/// `site_base`, except in tests that serve packages over local HTTP.
+pub async fn download(assignment: &Assignment) -> Result<Download, TaskError> {
+    let Assignment {
+        site,
+        set_id,
+        version,
+    } = assignment;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(default_number("fetchSeconds")))

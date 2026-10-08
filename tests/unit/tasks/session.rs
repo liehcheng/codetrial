@@ -1277,8 +1277,9 @@ async fn an_edit_is_held_to_the_byte_limit_and_to_its_own_id() {
             .acknowledge_edit("bigger", &format!("{at_limit}x"), 102)
             .is_err()
     );
-    // A captured revision's id cannot later name other code, even once it is
-    // no longer the current one.
+
+    // A captured revision's id cannot later name other code, even once it is no
+    // longer the current one.
     session
         .revision(capture("c1", "kept", "first", "discuss"), 103)
         .unwrap();
@@ -1332,7 +1333,7 @@ async fn a_practice_run_report_is_checked_field_by_field() {
         ),
         (
             "diagnostics too long",
-            practice("r3", "run-1", 0, 0, &"x".repeat(4097)),
+            practice("r3", "run-1", 0, 0, &"x".repeat(MAX_DIAGNOSTIC_BYTES + 1)),
         ),
         ("an unknown revision", practice("r4", "elsewhere", 1, 2, "")),
     ] {
@@ -1346,6 +1347,16 @@ async fn a_practice_run_report_is_checked_field_by_field() {
     session.run(practice("r6", "run-1", 2, 2, ""), 102).unwrap();
     assert!(session.seq() > seq);
     assert!(session.runs.contains_key("r6"));
+    // A runner failure may fill the diagnostics limit exactly.
+    session
+        .revision(capture("c2", "run-2", "b", "run"), 102)
+        .unwrap();
+    session
+        .run(
+            practice("r7", "run-2", 0, 0, &"x".repeat(MAX_DIAGNOSTIC_BYTES)),
+            102,
+        )
+        .unwrap();
 }
 
 #[tokio::test]
@@ -1452,4 +1463,194 @@ async fn a_page_ending_needs_version_one_and_a_request_id() {
         assert!(session.end(message, 101).is_err(), "{version} {id}");
         assert_eq!(session.phase, Phase::Work);
     }
+}
+
+#[tokio::test]
+async fn an_accepted_action_is_one_new_snapshot() {
+    let mut session = working().await;
+    let before = session.seq();
+    let id = session.current.id.clone();
+    assert!(
+        session
+            .action(action("discuss-once", "discuss", Some(&id)), 101)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(session.seq(), before + 1);
+    let before = session.seq();
+    // A retried request is not a change, so it is not a snapshot either.
+    session
+        .action(action("discuss-once", "discuss", Some(&id)), 102)
+        .unwrap();
+    assert_eq!(session.seq(), before);
+}
+
+#[tokio::test]
+async fn the_tick_lets_a_pending_run_go_at_exactly_its_expiry() {
+    let mut session = working().await;
+    let window = default_number("runCaptureSeconds");
+    session
+        .revision(capture("c1", "run-1", "a", "run"), 100)
+        .unwrap();
+    session.tick(100 + window - 1, false, false);
+    assert!(session.pending_run_revisions.contains_key("run-1"));
+    session.tick(100 + window, false, false);
+    // No longer pending, so it may be evicted like any other revision.
+    assert!(session.pending_run_revisions.is_empty());
+}
+
+#[tokio::test]
+async fn a_finished_attempt_ticks_to_nothing() {
+    let mut session = working().await;
+    session
+        .end(end("end-1", "invalid", "fullscreen"), 102)
+        .unwrap();
+    assert_eq!(session.phase, Phase::Feedback);
+    let seq = session.seq();
+    assert_eq!(session.tick(100_000, false, false), None);
+    assert_eq!(session.seq(), seq);
+}
+
+#[tokio::test]
+async fn a_second_nudge_waits_for_exactly_the_interval() {
+    let mut session = working().await;
+    let idle = default_number("nudgeIdleSeconds");
+    let interval = default_number("nudgeIntervalSeconds");
+    let first = 100 + idle;
+    assert!(session.tick(first, false, false).is_some());
+    // Still idle all the while; only the interval holds the second one back.
+    assert!(interval > idle);
+    assert!(session.tick(first + interval - 1, false, false).is_none());
+    assert!(session.tick(first + interval, false, false).is_some());
+}
+
+#[tokio::test]
+async fn only_an_evicted_revision_that_was_run_is_recorded_as_dropped() {
+    let mut session = working().await;
+    session
+        .revision(capture("ran", "z-ran", "ran", "run"), 101)
+        .unwrap();
+    session
+        .run(practice("result", "z-ran", 1, 2, ""), 101)
+        .unwrap();
+    // Sorted before it, so these are the ones evicted, and none was run.
+    for index in 0..12 {
+        session
+            .revision(
+                capture(
+                    &format!("talk-{index}"),
+                    &format!("a-{index:02}"),
+                    "talk",
+                    "discuss",
+                ),
+                102 + index,
+            )
+            .unwrap();
+    }
+    assert!(session.capture_overflow);
+    assert!(!session.revisions.contains_key("a-00"));
+    assert!(session.revisions.contains_key("z-ran"));
+    assert!(session.dropped_run_revision_ids.is_empty());
+}
+
+#[tokio::test]
+async fn a_followup_counts_only_for_a_turn_after_it_was_asked() {
+    let mut session = working().await;
+    session.observe_turn("turn-1", "I traced the input.", 101);
+    let followup = session.targeted_followup("trace").unwrap();
+    assert_eq!(followup["supportRequestId"], "followup-1");
+    // The turn it was asked after is not an answer to it.
+    session
+        .record_check("trace", "unresolved", "initial", "turn-1")
+        .unwrap();
+    assert_eq!(session.checks["trace"].support, Support::None);
+    session.observe_turn("turn-2", "The stack holds what is still open.", 102);
+    session
+        .record_check("trace", "covered", "initial", "turn-2")
+        .unwrap();
+    assert_eq!(session.checks["trace"].support, Support::TargetedFollowup);
+    assert_eq!(
+        session.checks["trace"].support_request_id.as_deref(),
+        Some("followup-1")
+    );
+}
+
+#[tokio::test]
+async fn a_turn_keeps_the_support_it_was_last_linked_to() {
+    let mut session = working().await;
+    session.action(action("hint", "hint", None), 101).unwrap();
+    session.observe_turn("turn-1", "I used the clue about the stack.", 102);
+    let before = session.seq();
+    session
+        .record_check("trace", "unresolved", "initial", "turn-1")
+        .unwrap();
+    // One recorded check is one new snapshot.
+    assert_eq!(session.seq(), before + 1);
+    assert_eq!(
+        session.checks["trace"].turn_support["turn-1"],
+        Support::None
+    );
+    session
+        .record_check_with_support("trace", "covered", "initial", "turn-1", Some("hint-1"))
+        .unwrap();
+    assert_eq!(
+        session.checks["trace"].turn_support["turn-1"],
+        Support::ConceptualHint
+    );
+    // Citing it again without the link does not launder the hint away.
+    session
+        .record_check("trace", "covered", "initial", "turn-1")
+        .unwrap();
+    assert_eq!(
+        session.checks["trace"].turn_support["turn-1"],
+        Support::ConceptualHint
+    );
+}
+
+#[tokio::test]
+async fn an_evidence_revision_already_held_is_cited_past_the_cap() {
+    let mut session = working().await;
+    session.observe_turn("turn-1", "I explained the state.", 101);
+    let cap = default_number("evidenceRevisions") as usize;
+    // The initial revision is one; the rest are new captures.
+    session
+        .record_check("trace", "covered", "initial", "turn-1")
+        .unwrap();
+    for index in 1..cap {
+        let revision = format!("r-{index}");
+        session
+            .revision(
+                capture(
+                    &format!("c-{index}"),
+                    &revision,
+                    &format!("code {index}"),
+                    "discuss",
+                ),
+                101,
+            )
+            .unwrap();
+        session
+            .record_check("trace", "covered", &revision, "turn-1")
+            .unwrap();
+    }
+    assert_eq!(session.evidence_revisions.len(), cap);
+    session
+        .revision(capture("c-over", "r-over", "code over", "discuss"), 101)
+        .unwrap();
+    assert!(
+        session
+            .record_check("trace", "covered", "r-over", "turn-1")
+            .is_err()
+    );
+    // One the evidence already holds costs nothing more.
+    session
+        .record_check("contract", "covered", "r-1", "turn-1")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn no_wrap_up_question_is_asked_during_work() {
+    let mut session = working().await;
+    assert_eq!(session.phase, Phase::Work);
+    assert_eq!(session.next_wrap_up_check(), None);
 }

@@ -86,6 +86,11 @@ async fn a_page_that_left_is_never_finalized_as_completed() {
     // whether it left or never joined.
     assert_eq!(page_loss(&session, gone(2), rejoin), PageLoss::Wait);
     assert_eq!(page_loss(&session, gone(10), rejoin), PageLoss::Stop);
+    // Before Start nothing is interrupted, however short the rejoin window.
+    assert_eq!(
+        page_loss(&session, gone(2), Duration::from_secs(1)),
+        PageLoss::Wait
+    );
     session.start(100);
     assert_eq!(page_loss(&session, gone(5), rejoin), PageLoss::Wait);
     assert_eq!(
@@ -180,6 +185,17 @@ fn a_deliberate_restart_is_not_shown_as_an_outage_until_it_fails() {
     assert_eq!(budget.outage_availability(), Some(Interviewer::Degraded));
 }
 
+/// The next frame the fixture socket received, failing rather than waiting
+/// forever when none is sent.
+async fn next_frame(
+    frames: &mut tokio::sync::mpsc::UnboundedReceiver<Option<String>>,
+) -> Option<String> {
+    tokio::time::timeout(Duration::from_secs(5), frames.recv())
+        .await
+        .expect("no frame was sent")
+        .unwrap()
+}
+
 /// A Gemini Live socket on a local port: completes setup, then hands every
 /// later frame to the test through the returned channel, a close included.
 async fn live_fixture(
@@ -259,21 +275,21 @@ async fn the_briefing_asks_for_a_reply_only_when_one_is_owed_and_nothing_else_wi
     brief_replacement(&mut gemini, &session, "", "I think the stack", &mut pending)
         .await
         .unwrap();
-    assert!(briefing_turn(frames.recv().await.unwrap()));
+    assert!(briefing_turn(next_frame(&mut frames).await));
     // Nothing owed: the briefing is context only, and Jim waits.
     let (mut gemini, mut frames) = live_fixture(&task).await;
     brief_replacement(&mut gemini, &session, "", "  ", &mut pending)
         .await
         .unwrap();
-    assert!(!briefing_turn(frames.recv().await.unwrap()));
+    assert!(!briefing_turn(next_frame(&mut frames).await));
     // Owed, but a queued action is replayed next and draws the reply itself.
     let (mut gemini, mut frames) = live_fixture(&task).await;
     let mut pending = VecDeque::from(["Discuss this acknowledged revision.".to_owned()]);
     brief_replacement(&mut gemini, &session, "", "I think the stack", &mut pending)
         .await
         .unwrap();
-    assert!(!briefing_turn(frames.recv().await.unwrap()));
-    assert!(frames.recv().await.unwrap().is_some());
+    assert!(!briefing_turn(next_frame(&mut frames).await));
+    assert!(next_frame(&mut frames).await.is_some());
     assert!(pending.is_empty());
 }
 
@@ -286,4 +302,74 @@ async fn a_session_dropped_without_shutdown_still_closes_its_socket() {
         .await
         .expect("the dropped session kept its socket open");
     assert_eq!(closed, Some(None));
+}
+
+#[test]
+fn a_started_attempt_holds_the_next_one_for_the_backoff() {
+    let now = Instant::now();
+    let mut budget = RecoveryBudget::new(now);
+    budget.failed(now);
+    assert!(budget.start_attempt(now));
+    // No failure reported yet: the attempt itself sets the wait.
+    assert!(!budget.start_attempt(now + super::super::COLD_OPEN_BACKOFF / 2));
+    assert!(budget.start_attempt(now + super::super::COLD_OPEN_BACKOFF));
+}
+
+/// The cap is the largest revision the session accepts, at JSON's worst
+/// spelling of each byte, plus room for the envelope around it, and no more.
+#[test]
+fn a_task_message_holds_the_largest_revision_and_little_else() {
+    let worst = serde_json::to_vec(&json!({"type": "task.revision", "version": 1,
+        "requestId": "r".repeat(64), "revisionId": "v".repeat(64),
+        "code": "\0".repeat(MAX_CODE_BYTES), "trigger": "discuss"}))
+    .unwrap()
+    .len();
+    assert!(worst <= MAX_TASK_MESSAGE_BYTES, "{worst}");
+    assert!(MAX_TASK_MESSAGE_BYTES - worst <= 4096, "{worst}");
+}
+
+#[test]
+fn each_recorded_usage_is_counted_into_the_room_total() {
+    let mut usage = LiveUsage::new();
+    let turn = crate::gemini::TokenUsage {
+        prompt: 7,
+        response: 3,
+        total: 10,
+        ..Default::default()
+    };
+    usage.record("task-room", turn);
+    usage.record("task-room", turn);
+    assert_eq!(usage.events, 2);
+    assert_eq!((usage.total.prompt, usage.total.total), (14, 20));
+    let summary = usage.summary("task-room", "live-model", super::super::LiveOutcome::Ok);
+    assert!(
+        summary.starts_with("codetrial live_usage room=task-room "),
+        "{summary}"
+    );
+    assert!(summary.contains(" model=live-model "), "{summary}");
+    assert!(summary.contains(" sockets=1 "), "{summary}");
+}
+
+#[test]
+fn the_learner_is_speaking_for_three_seconds_after_their_last_word() {
+    assert!(speaking(10, 10));
+    assert!(speaking(10, 12));
+    assert!(!speaking(10, 13));
+}
+
+#[test]
+fn a_wrap_up_question_waits_for_an_answer_or_its_time() {
+    let wait = default_number("wrapUpAnswerSeconds");
+    let quiet = 0;
+    // The first one is asked as soon as the learner is quiet.
+    assert!(wrap_up_due(None, 0, quiet, 100));
+    assert!(!wrap_up_due(None, 0, 99, 100));
+    // The next waits for a turn completed after the question...
+    assert!(!wrap_up_due(Some(100), 100, quiet, 101));
+    assert!(wrap_up_due(Some(100), 101, quiet, 101));
+    // ...or for the time an answer is given, exactly.
+    assert!(!wrap_up_due(Some(100), 100, quiet, 100 + wait - 1));
+    assert!(wrap_up_due(Some(100), 100, quiet, 100 + wait));
+    // Speech still holds it, even when it is due.
+    assert!(!wrap_up_due(Some(100), 101, 100 + wait, 100 + wait));
 }

@@ -52,10 +52,18 @@ async fn an_unlock_is_refused_before_any_download_when_the_link_or_pin_is_malfor
         let refused = Assignment::new(site, "classroom", 7);
         assert_eq!(refused.unwrap_err().code, "site_invalid", "{site}");
     }
-    for (set, version) in [("../etc", 7), ("classroom", 0)] {
+    for (set, version) in [
+        ("../etc", 7),
+        ("classroom", 0),
+        ("classroom", i32::MAX as u32 + 1),
+    ] {
         let refused = Assignment::new(SITE, set, version);
         assert_eq!(refused.unwrap_err().code, "site_invalid", "{set} {version}");
     }
+
+    // The largest version a learner's CodeTrial and the packaging tool agree
+    // on.
+    assert!(Assignment::new(SITE, "classroom", i32::MAX as u32).is_ok());
     let refused = TaskService::new()
         .unlock(1, &assignment("classroom", 7), "12345", 100)
         .await;
@@ -404,4 +412,94 @@ async fn only_the_running_attempts_own_room_is_pending() {
     );
     assert_eq!(service.result(2, "room-1", 102), ResultLookup::Unavailable);
     drop(task);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_site_clock_runs_on_from_the_download_and_ignores_the_learners() {
+    let unlocked = Unlocked {
+        set: SET.clone(),
+        site_clock: Some((1_000, Instant::now())),
+    };
+    tokio::time::advance(std::time::Duration::from_secs(30)).await;
+    assert_eq!(unlocked.now(5), 1_030);
+    // Without a site clock the learner's is all there is.
+    let local = Unlocked {
+        set: SET.clone(),
+        site_clock: None,
+    };
+    assert_eq!(local.now(5), 5);
+}
+
+#[test]
+fn a_service_is_equal_only_to_itself() {
+    let service = TaskService::new();
+    assert!(service == service.clone());
+    assert!(service != TaskService::new());
+}
+
+#[test]
+fn each_admission_is_its_own_claim_and_the_oldest_keys_are_forgotten_first() {
+    let service = unlocked_service();
+    let first = admit(&service, "key-0", 100);
+    let first_claim = first.claim_id;
+    drop(first);
+    let second = admit(&service, "key-1", 100);
+    assert_ne!(second.claim_id, first_claim);
+    drop(second);
+    let held = |key: &str| {
+        service
+            .0
+            .state
+            .lock()
+            .unwrap()
+            .admissions
+            .contains_key(&(1, key.to_owned()))
+    };
+    for index in 2..MAX_ADMISSIONS {
+        drop(admit(&service, &format!("key-{index}"), 100));
+    }
+    // Exactly the cap is held...
+    assert!(held("key-0"));
+    drop(admit(&service, "one-more", 100));
+    // ...and one past it lets the oldest go, and only that one.
+    assert!(!held("key-0"));
+    assert!(held("key-1"));
+}
+
+#[test]
+fn the_least_recently_opened_set_is_the_one_let_go() {
+    let service = TaskService::new();
+    let held = |owner: i64| {
+        service
+            .0
+            .state
+            .lock()
+            .unwrap()
+            .unlocked
+            .contains_key(&(owner, assignment("classroom", 7)))
+    };
+    for owner in 1..=MAX_UNLOCKED_SETS as i64 {
+        service.insert_unlocked(owner, SITE, SET.clone());
+    }
+    // Opening the first again makes it the most recent.
+    service.insert_unlocked(1, SITE, SET.clone());
+    assert!(held(1) && held(2));
+    service.insert_unlocked(99, SITE, SET.clone());
+    assert!(held(1));
+    assert!(!held(2));
+    assert!(held(3));
+}
+
+#[test]
+fn a_failed_setup_forgets_its_own_key_and_no_other() {
+    let service = unlocked_service();
+    drop(admit(&service, "earlier", 100));
+    let failing = admit(&service, "failing", 100);
+    service.finish_admission(1, "failing", failing.claim_id, None);
+    let state = service.0.state.lock().unwrap();
+    assert_eq!(
+        state.admission_order.iter().collect::<Vec<_>>(),
+        [&(1, "earlier".to_owned())]
+    );
+    assert!(!state.admissions.contains_key(&(1, "failing".to_owned())));
 }
