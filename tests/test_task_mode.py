@@ -293,6 +293,14 @@ class TaskSidecarTests(unittest.TestCase):
         default["understandingChecks"][0]["question"] = "changed"
         self.assertNotEqual(DEFAULT_CHECKS[0]["question"], "changed")
 
+    def test_judge_indexes_stay_within_what_codetrial_reads(self):
+        from problem_bank.task_structure import judge_options
+
+        judge_options({"kind": "function", "outputParam": 2**64 - 1})
+        for value in (-1, 2**64, True):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                judge_options({"kind": "function", "outputParam": value})
+
 
 if __name__ == "__main__":
     unittest.main()

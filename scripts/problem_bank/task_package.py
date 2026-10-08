@@ -358,6 +358,14 @@ def site_base(site):
     from urllib.parse import urlsplit
 
     parts = urlsplit(site or "")
+    try:
+        # `urlsplit` checks a port only when asked for it; CodeTrial refuses a
+        # bad one, so the links built from this must not carry one either.
+        parts.port
+    except ValueError:
+        raise ValueError(
+            "--site must be an https URL without credentials or query"
+        ) from None
     if (
         parts.scheme != "https"
         or not parts.hostname

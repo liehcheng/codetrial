@@ -1,4 +1,5 @@
 use super::*;
+use crate::tasks::session::OutcomeKind;
 use crate::tasks::test_support::admitted;
 
 #[test]

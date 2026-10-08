@@ -92,6 +92,9 @@ const SAMPLE_INTERVAL_MS = 500;
 const CALIBRATION_PHASE_MS = 10000;
 const recoveryKey = () =>
   `codetrial-task-result:${JSON.stringify([setId, taskId, site, version])}`;
+// A Start sent but not yet confirmed: its room, polling deadline and storage
+// key, kept so a reload in between still finds its way back to the result.
+let startInFlight = null;
 // This tab was reloaded into an attempt it can only collect the result of.
 let restored = false;
 function rememberAttempt(
@@ -199,7 +202,12 @@ function error(value) {
     } else if (value.code === "package_unavailable") show("unlock");
     else if (["request_key_expired", "setup_failed"].includes(value.code))
       admissionKey = id();
-    else if (!task && !hasStarted()) loadTask().catch(error);
+    // This click is the gesture a permission prompt needs, so it asks again
+    // rather than only dismissing the message.
+    else if (value.code === "devices_required") {
+      $("devices").disabled = false;
+      $("devices").click();
+    } else if (!task && !hasStarted()) loadTask().catch(error);
   };
 }
 
@@ -680,15 +688,24 @@ $("start").onclick = () => {
         Date.now() +
         (task.rules.durationMin * 60 + task.reviewDeliverySeconds) * 1000;
       const until = reviewPollUntil;
+      // A reload while Start is on its way cannot tell whether it arrived,
+      // so `pagehide` keeps a way back to the result in case it did.
+      startInFlight = {
+        room: startingRoomName,
+        until,
+        key: startRecoveryKey,
+      };
       try {
         await send(TASK_TOPICS.start, taskStartPayload());
       } catch {
+        startInFlight = null;
         if (room === startingRoom) dropConnection();
         throw {
           code: "setup_failed",
           message: "Start could not be sent. Calibrate again to reconnect.",
         };
       }
+      startInFlight = null;
       if (
         activeRoomName === startingRoomName &&
         (!room || room === startingRoom)
@@ -827,10 +844,18 @@ function countdown(verdict) {
 
 /// Ends the attempt under a rule or a failure. Monitoring stops first, so
 /// CodeTrial leaving fullscreen afterwards is not itself reported.
+/// The attempt is over: from now the result is due within the delivery
+/// window, however much of the task's time went unused.
+function attemptOver() {
+  attempt = "ending";
+  reviewPollUntil = Date.now() + task.reviewDeliverySeconds * 1000;
+  rememberAttempt();
+  stopMonitoring();
+}
+
 function endAttempt(outcome, cause, durationMs) {
   if (!monitoring()) return;
-  attempt = "ending";
-  stopMonitoring();
+  attemptOver();
   lock();
   // An ending that cannot be sent must not leave the attempt running
   // unwatched: leaving the room makes the server end it as interrupted.
@@ -850,9 +875,11 @@ document.addEventListener("fullscreenchange", () => {
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) endAttempt("invalid", "visibility", 0);
 });
-window.addEventListener("pagehide", () =>
-  endAttempt("interrupted", "reload", 0),
-);
+window.addEventListener("pagehide", () => {
+  if (startInFlight)
+    rememberAttempt(startInFlight.room, startInFlight.until, startInFlight.key);
+  endAttempt("interrupted", "reload", 0);
+});
 
 // --- The work ----------------------------------------------------------------
 
@@ -886,8 +913,7 @@ function renderState(incoming) {
   if (state.phase === "feedback" && attempt === "running") {
     // The server ended it (Finish or time): stop watching before leaving
     // fullscreen.
-    attempt = "ending";
-    stopMonitoring();
+    attemptOver();
     leaveFullscreen();
   }
   lock();

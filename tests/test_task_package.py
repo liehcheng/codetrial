@@ -220,10 +220,7 @@ class TaskPackageTests(unittest.TestCase):
                 if "sidecar" in row
                 else {},
             }
-            with (
-                self.subTest(refusal=refusal["name"]),
-                self.assertRaises(ValueError),
-            ):
+            with self.subTest(refusal=refusal["name"]), self.assertRaises(ValueError):
                 validate_package(source)
 
     def test_posed_bank_golden_matches_python_judges_starters_and_notes(self):
@@ -418,6 +415,9 @@ class TaskPackageTests(unittest.TestCase):
                 "http://teacher.github.io/course",
                 "https://user:secret@teacher.github.io",
                 "https://teacher.github.io/course?x=1",
+                # A port `urlsplit` only checks when asked for it.
+                "https://teacher.github.io:99999/course",
+                "https://teacher.github.io:port/course",
             ):
                 with self.subTest(site=site), self.assertRaises(ValueError):
                     build(bank, "classroom", 7, PIN, site, directory / "publish")

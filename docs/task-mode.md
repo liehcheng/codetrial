@@ -324,8 +324,9 @@ the lap. From the moment a continuous look-away passes half the threshold, the
 page shows a countdown and plays a sound, so a learner who is not watching the
 screen still learns they are about to end the attempt.
 
-The camera rule reads the detector's face count, box and six keypoints (eyes,
-nose, mouth, ears) to estimate head pitch relative to the learner's own
+The camera rule reads the detector's face count, box and keypoints, and
+estimates head pitch from where the nose sits between the eyes and the mouth
+(or from the box when the keypoints are missing), relative to the learner's own
 calibration. It does not read eye gaze, expression or anything else about a
 face. Frames never leave the machine and are not recorded. Only successful,
 fresh samples count: a detector that stops answering, a camera track that ends
@@ -394,7 +395,9 @@ Start, the page lets the room go and asks for calibration again, which connects
 afresh under a new request key; the server frees the account within ten
 seconds of a page leaving before Start, or of one never joining.
 
-Errors contain exactly `code`, `retryable`, `message`; no secrets.
+Errors contain exactly `code`, `retryable`, `message`; no secrets. An HTTP
+status of `page` marks an error the page raises itself, before or without any
+request, and `wire` one the room sends on the data channel.
 
 | Code                      | HTTP | Retryable | Recovery action                  |
 | ------------------------- | ---- | --------- | -------------------------------- |
@@ -410,9 +413,9 @@ Errors contain exactly `code`, `retryable`, `message`; no secrets.
 | `set_closed`              | 410  | false     | Return to task list              |
 | `task_not_found`          | 404  | false     | Return to task list              |
 | `rules_unacknowledged`    | 403  | false     | Read and accept the rules        |
-| `devices_required`        | 403  | true      | Allow microphone and camera      |
+| `devices_required`        | page | true      | Allow microphone and camera      |
 | `calibration_required`    | 403  | true      | Run calibration                  |
-| `fullscreen_required`     | 403  | true      | Retry Start                      |
+| `fullscreen_required`     | page | true      | Retry Start                      |
 | `client_override`         | 400  | false     | Reload                           |
 | `request_too_large`       | 413  | false     | Reload                           |
 | `language_unsupported`    | 400  | false     | Select Python                    |

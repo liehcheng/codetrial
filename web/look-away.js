@@ -64,13 +64,23 @@ export function calibrate(screenSamples, typingSamples) {
     typingSamples.length < MIN_PHASE_SAMPLES
   )
     return { ok: false, reason: "too_few_samples" };
+  // The baseline is measured one way, the one most samples allow, and that
+  // way alone has to cover the phase: a few keypoint samples among box ones
+  // would otherwise set the limit from almost nothing.
   const screen = measured(screenSamples);
-  if (screen.length < MIN_FACE_SHARE * screenSamples.length)
-    return { ok: false, reason: "face_not_steady" };
-  const kind = screen[0].kind;
+  const kinds = screen.map((row) => row.kind);
+  const kind = kinds
+    .slice()
+    .sort(
+      (a, b) =>
+        kinds.filter((item) => item === b).length -
+        kinds.filter((item) => item === a).length,
+    )[0];
   const values = screen
     .filter((row) => row.kind === kind)
     .map((row) => row.value);
+  if (values.length < MIN_FACE_SHARE * screenSamples.length)
+    return { ok: false, reason: "face_not_steady" };
   const baseline = quantile(values, 0.5);
   const spread = quantile(
     values.map((value) => Math.abs(value - baseline)),
@@ -132,8 +142,15 @@ export function createLookAwayMonitor({
       // The interval after a missed sample was not observed either, so a
       // look-away resumed after a gap counts only from this sample.
       const afterMiss = lastMissed;
-      lastMissed = !sample?.available;
-      if (!sample?.available) {
+      // A face measured some other way than the calibration was is no
+      // evidence either way, so it counts as a missed sample: it neither
+      // clears a look-away nor extends one.
+      const measured =
+        sample?.available && sample.count >= 1 ? downMetric(sample.face) : null;
+      const comparable = measured?.kind === metric;
+      const missed = !sample?.available || (sample.count >= 1 && !comparable);
+      lastMissed = missed;
+      if (missed) {
         if (now - lastGood >= gapMs) return { state: "interrupted", awayMs: 0 };
         if (awaySince === null) return { state: "ok", awayMs: 0 };
         // Nothing was seen since the last sample, so that time is not
@@ -146,10 +163,7 @@ export function createLookAwayMonitor({
         return { state: "interrupted", awayMs: 0 };
       }
       lastGood = now;
-      const measured = sample.count >= 1 ? downMetric(sample.face) : null;
-      const down =
-        measured && measured.kind === metric && measured.value > limit;
-      if (sample.count >= 1 && !down) {
+      if (sample.count >= 1 && measured.value <= limit) {
         awaySince = null;
         return { state: "ok", awayMs: 0 };
       }

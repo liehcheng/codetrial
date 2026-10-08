@@ -30,6 +30,16 @@
         "revisionId": null,
         "targetId": "closer-branch"
       }
+    },
+    {
+      "name": "discuss",
+      "payload": {
+        "version": 1,
+        "requestId": "discuss-1",
+        "action": "discuss",
+        "revisionId": "revision-1",
+        "targetId": null
+      }
     }
   ]
 }

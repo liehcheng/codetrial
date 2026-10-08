@@ -28,7 +28,7 @@ the camera required, because the recording notice describes a video recording.
 
 ## Response windows
 
-The replay page lists a *response window* for each turn the interviewer took:
+The replay page lists a _response window_ for each turn the interviewer took:
 the time between the interviewer finishing that turn and the interviewer
 speaking again, taken from the `avatar` state rows the browser recorded. A
 window no candidate transcript turn was attributed to says so; the turn itself
@@ -133,7 +133,8 @@ them are listed on the instructor's page and again before Start, with what is
 not detected.
 
 Second, the camera rule reads more than a count. Task mode estimates head pitch
-from the detector's six facial keypoints, against a calibration the learner
+from where the nose sits between the eyes and the mouth, as the detector's
+keypoints place them (or from the face box when it gives none), against a calibration the learner
 runs before the attempt, because the rule's purpose is sustained attention
 somewhere below the screen, such as a phone in the lap. It still does not read
 eye gaze, expression, or anything that would support a claim about what a

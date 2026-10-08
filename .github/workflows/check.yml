@@ -283,9 +283,11 @@ jobs:
 
       - name: Install instructor packaging dependencies
         run: |
-          python3 -m venv target/task-tools
-          target/task-tools/bin/pip install -r scripts/requirements-task.txt
-          echo "PYTHON=$PWD/target/task-tools/bin/python" >> "$GITHUB_ENV"
+          # Outside target/, which is cached: a restored venv would keep a
+          # package the requirements file has since dropped.
+          python3 -m venv "$RUNNER_TEMP/task-tools"
+          "$RUNNER_TEMP/task-tools/bin/pip" install -r scripts/requirements-task.txt
+          echo "PYTHON=$RUNNER_TEMP/task-tools/bin/python" >> "$GITHUB_ENV"
 
       # The Python here generates the problem bank and drives two integration
       # harnesses, and `ruff check` is its only linter. The gate skips when the

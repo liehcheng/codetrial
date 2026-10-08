@@ -82,7 +82,11 @@ def judge_options(judge):
         if key in judge:
             text(judge[key])
     for key in ("outputParam", "outputPrefixParam", "cyclePosParam"):
-        if key in judge and (type(judge[key]) is not int or judge[key] < 0):
+        # The learner's CodeTrial reads these as u64; past that it refuses the
+        # set, so packaging refuses it first.
+        if key in judge and (
+            type(judge[key]) is not int or not 0 <= judge[key] < 2**64
+        ):
             raise ValueError("invalid judge parameter index")
 
 

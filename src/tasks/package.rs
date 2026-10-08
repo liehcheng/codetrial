@@ -53,6 +53,7 @@ impl SetConfig {
     /// The rules as the learner reads them and their result records them.
     pub fn rules_json(&self) -> serde_json::Value {
         serde_json::json!({"durationMin": self.rule("durationMin"),
+            "maxHintRungs": self.rule("maxHintRungs"),
             "lookAwaySeconds": self.rule("lookAwaySeconds"),
             "closesAt": self.closes_at, "rulesNote": self.rules_note})
     }
@@ -249,6 +250,14 @@ pub fn open_package(
     let plaintext = key
         .open_within(nonce, aead::Aad::from(aad), &mut ciphertext, 12..)
         .map_err(|_| OpenError::WrongPin)?;
+    Ok(decode(set_id, version, plaintext)?)
+}
+
+/// A decrypted package checked and posed: the authenticated metadata must
+/// name the set it was opened for, the rules must be in bounds, and every
+/// record must validate. Apart from `open_package` so these checks are tested
+/// without paying a key derivation each time.
+pub(crate) fn decode(set_id: &str, version: u32, plaintext: &[u8]) -> Result<LoadedSet, TaskError> {
     let package: Package =
         serde_json::from_slice(plaintext).map_err(|_| invalid("invalid package schema"))?;
     if package.package_version != 1
@@ -256,7 +265,7 @@ pub fn open_package(
         || package.set_version != version
         || package.problems.is_empty()
     {
-        return Err(invalid("invalid authenticated package metadata").into());
+        return Err(invalid("invalid authenticated package metadata"));
     }
     let (rules, closes_at, rules_note) = checked_rules(package.rules)?;
     let mut records = BTreeMap::new();
@@ -275,7 +284,7 @@ pub fn open_package(
         let sidecar = package.sidecars.get(id);
         let row = serde_json::json!({"problem": problem, "judge": judge, "variant": variant, "sidecar": sidecar});
         if serde_json::to_vec(&row).unwrap().len() > default_number("taskBytes") as usize {
-            return Err(invalid("plaintext task exceeds limit").into());
+            return Err(invalid("plaintext task exceeds limit"));
         }
         if records
             .insert(
@@ -284,7 +293,7 @@ pub fn open_package(
             )
             .is_some()
         {
-            return Err(invalid("duplicate task id").into());
+            return Err(invalid("duplicate task id"));
         }
     }
     let ids: HashSet<_> = records.keys().collect();
@@ -292,7 +301,7 @@ pub fn open_package(
         || package.variants.keys().collect::<HashSet<_>>() != ids
         || package.sidecars.keys().any(|id| !records.contains_key(id))
     {
-        return Err(invalid("orphan bank record").into());
+        return Err(invalid("orphan bank record"));
     }
     Ok(LoadedSet {
         config: SetConfig {

@@ -22,16 +22,23 @@ test("arithmetic follows ordinary precedence and associativity", () => {
 });
 
 test("bad input names its problem and never runs code", () => {
-  for (const text of [
-    "",
-    "1 +",
-    "(1 + 2",
-    "alert(1)",
-    "1 / 0",
-    "sqrt 4",
-    "2 $ 3",
-    "constructor",
-    "1".repeat(MAX_EXPRESSION_LENGTH + 1),
+  for (const [text, message] of [
+    ["", "Enter an expression"],
+    ["1 +", "The expression ends too early"],
+    ["(1 + 2", "A parenthesis is not closed"],
+    ["alert(1)", 'Unknown name "alert"'],
+    ["1 / 0", "The result is not a finite number"],
+    ["sqrt 4", "sqrt needs parentheses"],
+    ["2 $ 3", 'Unexpected "$"'],
+    ["constructor", 'Unknown name "constructor"'],
+    ["1".repeat(MAX_EXPRESSION_LENGTH + 1), "The expression is too long"],
   ])
+    assert.throws(() => evaluate(text), { message }, text);
+  // Nothing typed is ever run as code: an expression that would change state
+  // if it were is refused, and the state is untouched.
+  globalThis.calculatorProbe = 0;
+  for (const text of ["calculatorProbe = 1", "calculatorProbe++"])
     assert.throws(() => evaluate(text), Error, text);
+  assert.equal(globalThis.calculatorProbe, 0);
+  delete globalThis.calculatorProbe;
 });

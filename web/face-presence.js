@@ -34,14 +34,21 @@ export function faceGeometry(detections, score) {
     if (!best || score(detection) > score(best)) best = detection;
   }
   const box = best?.boundingBox;
-  if (!box || !Number.isFinite(box.xCenter) || !Number.isFinite(box.height))
+  if (
+    !box ||
+    !["xCenter", "yCenter", "width", "height"].every((key) =>
+      Number.isFinite(box[key]),
+    )
+  )
     return null;
-  const landmarks = Array.isArray(best.landmarks)
-    ? best.landmarks
-        .filter(
-          (point) => Number.isFinite(point?.x) && Number.isFinite(point?.y),
-        )
-        .map((point) => [point.x, point.y])
+  // All or none: the head-down measure reads eyes, nose and mouth by
+  // position, so dropping one bad point would shift the rest into the wrong
+  // places. Without them the measure falls back to the box.
+  const points = Array.isArray(best.landmarks) ? best.landmarks : [];
+  const landmarks = points.every(
+    (point) => Number.isFinite(point?.x) && Number.isFinite(point?.y),
+  )
+    ? points.map((point) => [point.x, point.y])
     : [];
   return {
     box: [box.xCenter, box.yCenter, box.width, box.height],

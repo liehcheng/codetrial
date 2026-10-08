@@ -315,3 +315,47 @@ async fn the_review_reads_turns_in_the_order_they_were_spoken() {
     let tenth = prompt.find("\"turn-10\"").unwrap();
     assert!(second < tenth, "turn-10 was read before turn-2");
 }
+
+#[tokio::test]
+async fn a_hinted_turn_past_the_reference_cap_still_counts_as_supported() {
+    let mut session = session().await;
+    // Fill the check's reference list with independent turns first.
+    for index in 2..=8 {
+        let turn = format!("turn-{index}");
+        session.observe_turn(&turn, "I traced the loop state once more.", 111);
+        session
+            .record_check("trace", "covered", "initial", &turn)
+            .unwrap();
+    }
+    session
+        .action(
+            crate::tasks::session::Action {
+                version: 1,
+                request_id: "clue".to_owned(),
+                action: crate::tasks::session::ActionKind::Hint,
+                revision_id: None,
+                target_id: None,
+            },
+            112,
+        )
+        .unwrap();
+    session.observe_turn("turn-9", "After the clue I traced it again.", 113);
+    session
+        .record_check_with_support("trace", "covered", "initial", "turn-9", Some("hint-1"))
+        .unwrap();
+    assert!(
+        !session.checks["trace"]
+            .turn_ids
+            .contains(&"turn-9".to_owned())
+    );
+    let mut value = review();
+    let dimension = &mut value["dimensions"]["reasoningParticipation"];
+    dimension["rating"] = json!(3);
+    dimension["reason"] = json!("The learner traced the loop again.");
+    dimension["insufficientReason"] = Value::Null;
+    dimension["evidence"] = json!([{"kind": "turn", "id": "turn-9"}]);
+    assert!(
+        validate(&session, &value, "").is_err(),
+        "a turn after a hint was rated as independent"
+    );
+}

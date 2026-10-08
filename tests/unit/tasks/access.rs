@@ -180,6 +180,12 @@ async fn a_closed_set_refuses_new_attempts() {
 async fn the_result_is_pending_while_the_attempt_lasts_then_held_for_its_room_only() {
     let service = unlocked_service();
     let task = admit(&service, "start", 100);
+    service.finish_admission(
+        1,
+        "start",
+        task.claim_id,
+        Some(json!({"roomName": "room-1"})),
+    );
     assert_eq!(service.result(1, "room-1", 150), ResultLookup::Pending);
     task.retain_result("room-1", json!({"assessmentMode": "task", "x": 1}), 200);
     drop(task);
@@ -359,4 +365,43 @@ async fn open_keeps_one_package_per_assignment_and_evicts_the_oldest() {
         "unlock_required"
     );
     assert!(service.load_task(1, &here, "delimiter-closer").is_ok());
+}
+
+#[tokio::test]
+async fn one_process_runs_one_attempt_whoever_asks() {
+    let service = unlocked_service();
+    service.insert_unlocked(2, SITE, SET.clone());
+    let first = admit(&service, "start", 100);
+    let second = service.begin_admission(
+        2,
+        ("other", 7),
+        &assignment("classroom", 7),
+        "delimiter-closer",
+        "start",
+        preparation(),
+        101,
+    );
+    assert_eq!(second.err().unwrap().code, "active_task_session");
+    drop(first);
+}
+
+#[tokio::test]
+async fn only_the_running_attempts_own_room_is_pending() {
+    let service = unlocked_service();
+    let task = admit(&service, "start", 100);
+    // Before the admission answers with its room, no room is the attempt's.
+    assert_eq!(service.result(1, "room-1", 101), ResultLookup::Unavailable);
+    service.finish_admission(
+        1,
+        "start",
+        task.claim_id,
+        Some(json!({"roomName": "room-1"})),
+    );
+    assert_eq!(service.result(1, "room-1", 102), ResultLookup::Pending);
+    assert_eq!(
+        service.result(1, "stale-room", 102),
+        ResultLookup::Unavailable
+    );
+    assert_eq!(service.result(2, "room-1", 102), ResultLookup::Unavailable);
+    drop(task);
 }

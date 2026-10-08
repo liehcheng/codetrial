@@ -435,6 +435,7 @@ function taskStamps(overrides = {}) {
     rulesAcknowledgedAt: "2026-10-07T00:00:00Z",
     rules: {
       durationMin: 15,
+      maxHintRungs: 3,
       lookAwaySeconds: 8,
       closesAt: null,
       rulesNote: null,
@@ -615,6 +616,10 @@ const files = {
       {
         name: "hint about one target",
         payload: lib.taskActionPayload("hint-2", "hint", null, "closer-branch"),
+      },
+      {
+        name: "discuss",
+        payload: lib.taskActionPayload("discuss-1", "discuss", "revision-1"),
       },
     ],
   },

@@ -321,10 +321,16 @@ pub(crate) async fn task_load_handler(
     // After the session, so an anonymous request is told to sign in before
     // anything about its query.
     TaskOwner(owner): TaskOwner,
-    Query(query): Query<AssignmentQuery>,
+    query: Result<Query<AssignmentQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     let Some(service) = service(&state, &headers) else {
         return task_mode_off();
+    };
+
+    // A query that does not parse is a malformed assignment link, said in the
+    // task error shape rather than the framework's.
+    let Ok(Query(query)) = query else {
+        return task_error(AccessError::new("site_invalid"));
     };
     if task_github(&owner.user).is_none() {
         return task_error(AccessError::new("authentication_required"));

@@ -332,8 +332,14 @@ impl RoomDispatcher for RecordingDispatcher {
         &self,
         room_name: &str,
         provider: &codetrial::config::Provider,
-        _: AgentJob,
+        job: AgentJob,
     ) -> Result<(), DispatchRefusal> {
+        // `/api/token` starts interviews only; a task attempt has its own
+        // route.
+        assert!(
+            matches!(job, AgentJob::Interview),
+            "an interview start dispatched a task"
+        );
         if self.at_capacity.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(DispatchRefusal::AtCapacity);
         }

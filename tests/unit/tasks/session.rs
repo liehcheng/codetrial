@@ -661,7 +661,10 @@ async fn a_check_reference_past_the_cap_is_marked_as_overflow() {
         assert_eq!(session.capture_overflow, index > 8, "after {turn}");
     }
     assert_eq!(session.checks["trace"].turn_ids.len(), 8);
-    assert!(!session.checks["trace"].turn_support.contains_key("turn-9"));
+
+    // The reference list is capped, but the turn's support binding is kept, so
+    // citing it later still says whether it followed a hint.
+    assert!(session.checks["trace"].turn_support.contains_key("turn-9"));
 }
 
 #[tokio::test]
@@ -867,5 +870,586 @@ async fn an_overflow_from_a_recorded_check_is_published() {
             assert!(session.seq() > before, "the overflow was not published");
         }
         assert!(index < 64, "never overflowed");
+    }
+}
+
+#[tokio::test]
+async fn wrap_up_questions_stop_when_the_time_does() {
+    let mut session = TaskSession::new(admitted().await, 100);
+    assert!(!session.wrap_up_open(100), "not before wrap-up");
+    session.start(100);
+    let deadline = session.deadline_at.unwrap();
+    session.tick(deadline - 60, false, false);
+    assert_eq!(session.phase, Phase::WrapUp);
+    assert!(session.wrap_up_open(deadline - 1));
+    assert!(
+        !session.wrap_up_open(deadline),
+        "a tick at the deadline asks nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_run_whose_capture_has_expired_is_refused_before_any_sweep() {
+    let mut session = TaskSession::new(admitted().await, 100);
+    session.start(100);
+    session
+        .revision(
+            RevisionMessage {
+                version: 1,
+                request_id: "capture-1".to_owned(),
+                revision_id: "run-1".to_owned(),
+                code: "draft".to_owned(),
+                trigger: Trigger::Run,
+            },
+            101,
+        )
+        .unwrap();
+    let expires = 101 + default_number("runCaptureSeconds");
+    let run = |id: &str| RunMessage {
+        version: 1,
+        request_id: id.to_owned(),
+        run_id: id.to_owned(),
+        revision_id: "run-1".to_owned(),
+        passed: 1,
+        total: 2,
+        diagnostics: String::new(),
+    };
+    assert!(session.run(run("late"), expires).is_err());
+    assert!(session.run(run("on-time"), expires - 1).is_ok());
+}
+
+/// One page message as the room hands it over.
+fn send(
+    session: &mut TaskSession,
+    topic: &str,
+    payload: Value,
+    now: u64,
+) -> Option<Result<Option<String>, TaskError>> {
+    session.receive(
+        Some(topic),
+        &serde_json::to_vec(&payload).unwrap(),
+        "GREETING",
+        now,
+    )
+}
+
+#[tokio::test]
+async fn start_is_accepted_only_after_the_handshake_from_a_present_page() {
+    use crate::runtime::{TOPIC_TASK_CONNECTED, TOPIC_TASK_START};
+    let mut session = TaskSession::new(admitted().await, 100);
+    // Neither an unknown topic nor a malformed handshake does anything.
+    assert!(
+        session
+            .receive(Some("elsewhere"), b"{}", "GREETING", 100)
+            .is_none()
+    );
+    assert!(session.receive(None, b"{}", "GREETING", 100).is_none());
+    assert!(
+        send(
+            &mut session,
+            TOPIC_TASK_CONNECTED,
+            json!({"version": 2}),
+            100
+        )
+        .is_none()
+    );
+    assert!(!session.ready_acknowledged);
+    // Start before the handshake is not taken.
+    assert!(send(&mut session, TOPIC_TASK_START, json!({"version": 1}), 100).is_none());
+    assert_eq!(session.phase, Phase::Ready);
+    // A page that is not in the room cannot shake hands either.
+    session.page_absent = true;
+    assert!(!session.page_present());
+    assert!(
+        send(
+            &mut session,
+            TOPIC_TASK_CONNECTED,
+            json!({"version": 1}),
+            100
+        )
+        .is_none()
+    );
+    session.page_absent = false;
+    assert!(session.page_present());
+    assert_eq!(
+        send(
+            &mut session,
+            TOPIC_TASK_CONNECTED,
+            json!({"version": 1}),
+            100
+        )
+        .unwrap()
+        .unwrap(),
+        None
+    );
+    assert!(session.ready_acknowledged);
+    // A malformed Start, then one from an absent page, are both ignored.
+    assert!(send(&mut session, TOPIC_TASK_START, json!({"version": 2}), 100).is_none());
+    session.page_absent = true;
+    assert!(send(&mut session, TOPIC_TASK_START, json!({"version": 1}), 100).is_none());
+    session.page_absent = false;
+    assert_eq!(session.phase, Phase::Ready);
+    let seq = session.seq();
+    // The first Start greets and starts the clock; a repeat says nothing.
+    assert_eq!(
+        send(&mut session, TOPIC_TASK_START, json!({"version": 1}), 100)
+            .unwrap()
+            .unwrap()
+            .as_deref(),
+        Some("GREETING")
+    );
+    assert_eq!(session.phase, Phase::Work);
+    assert!(session.seq() > seq);
+    assert_eq!(
+        send(&mut session, TOPIC_TASK_START, json!({"version": 1}), 101)
+            .unwrap()
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn every_page_message_reaches_its_session_effect() {
+    use crate::runtime::{
+        TOPIC_CODE_UPDATE, TOPIC_TASK_ACTION, TOPIC_TASK_END, TOPIC_TASK_REVISION, TOPIC_TASK_RUN,
+        TOPIC_TASK_THINKING,
+    };
+    let mut session = TaskSession::new(admitted().await, 100);
+    session.start(100);
+    // An edit in another language is refused; in Python it is the revision.
+    assert!(
+        send(
+            &mut session,
+            TOPIC_CODE_UPDATE,
+            json!({"revisionId": "draft", "code": "x", "language": "java"}),
+            101
+        )
+        .unwrap()
+        .is_err()
+    );
+    assert!(
+        send(
+            &mut session,
+            TOPIC_CODE_UPDATE,
+            json!({"revisionId": "draft", "code": "x", "language": "python"}),
+            101
+        )
+        .unwrap()
+        .is_ok()
+    );
+    assert_eq!(session.current.id, "draft");
+    // A capture, then its run, which asks the interviewer about the result.
+    assert!(
+        send(&mut session, TOPIC_TASK_REVISION,
+            json!({"version": 1, "requestId": "c1", "revisionId": "draft", "code": "x", "trigger": "run"}), 102)
+        .unwrap()
+        .is_ok()
+    );
+    assert_eq!(
+        session.acknowledged_capture_request_id.as_deref(),
+        Some("c1")
+    );
+    let asked = send(
+        &mut session,
+        TOPIC_TASK_RUN,
+        json!({"version": 1, "requestId": "r1", "runId": "run-1", "revisionId": "draft",
+            "passed": 1, "total": 2, "diagnostics": ""}),
+        103,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(asked.unwrap().contains("practice result"));
+    assert!(session.runs.contains_key("run-1"));
+    // A runner failure (no cases) is recorded but asks nothing.
+    send(&mut session, TOPIC_TASK_REVISION,
+        json!({"version": 1, "requestId": "c2", "revisionId": "draft", "code": "x", "trigger": "run"}), 104)
+    .unwrap()
+    .unwrap();
+    let quiet = send(
+        &mut session,
+        TOPIC_TASK_RUN,
+        json!({"version": 1, "requestId": "r2", "runId": "run-2", "revisionId": "draft",
+            "passed": 0, "total": 0, "diagnostics": "runner down"}),
+        105,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(quiet, None);
+    // A malformed message on a known topic is an error, not silence.
+    for topic in [
+        TOPIC_TASK_END,
+        TOPIC_TASK_ACTION,
+        TOPIC_TASK_REVISION,
+        TOPIC_TASK_RUN,
+        TOPIC_CODE_UPDATE,
+        TOPIC_TASK_THINKING,
+    ] {
+        assert!(
+            send(&mut session, topic, json!({"nonsense": true}), 106)
+                .unwrap()
+                .is_err(),
+            "{topic}"
+        );
+    }
+    // Thinking quietly is version 1, during work only.
+    assert!(
+        send(
+            &mut session,
+            TOPIC_TASK_THINKING,
+            json!({"version": 2, "thinking": true}),
+            106
+        )
+        .unwrap()
+        .is_err()
+    );
+    send(
+        &mut session,
+        TOPIC_TASK_THINKING,
+        json!({"version": 1, "thinking": true}),
+        106,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(session.thinking);
+    // An action goes through, and Finish clears thinking for the locked page.
+    let finish = send(&mut session, TOPIC_TASK_ACTION,
+        json!({"version": 1, "requestId": "f1", "action": "finish", "revisionId": "draft", "targetId": null}), 107)
+    .unwrap()
+    .unwrap();
+    assert!(finish.unwrap().contains("Finish"));
+    assert!(!session.thinking);
+    // The page's ending ends it.
+    send(&mut session, TOPIC_TASK_END,
+        json!({"version": 1, "requestId": "e1", "outcome": "invalid", "cause": "visibility", "durationMs": 0}), 108)
+    .unwrap()
+    .unwrap();
+    assert!(session.ended_short());
+    assert!(
+        send(
+            &mut session,
+            TOPIC_TASK_THINKING,
+            json!({"version": 1, "thinking": true}),
+            109
+        )
+        .unwrap()
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn only_an_invalid_or_interrupted_ending_is_short() {
+    let mut session = TaskSession::new(admitted().await, 100);
+    assert!(!session.ended_short(), "not before it ends");
+    session.start(100);
+    session.conclude(Cause::Finish, 0, 200);
+    assert!(!session.ended_short(), "a completed attempt is not short");
+    let mut lost = TaskSession::new(admitted().await, 100);
+    lost.start(100);
+    lost.conclude(Cause::RoomLoss, 0, 200);
+    assert!(lost.ended_short());
+}
+
+#[tokio::test]
+async fn the_interviewers_tools_answer_from_the_session() {
+    let mut session = TaskSession::new(admitted().await, 100);
+    session.start(100);
+    session.observe_turn("turn-1", "I traced the loop state.", 101);
+    let editor = session.answer_tool("read_editor", &json!({}));
+    assert_eq!(editor["revisionId"], "initial");
+    assert_eq!(editor["untrusted"], true);
+    assert!(
+        editor["code"]
+            .as_str()
+            .unwrap()
+            .contains("TASK_COMPLETE_CLOSER")
+    );
+    let recorded = session.answer_tool(
+        "record_task_check",
+        &json!({"checkId": "trace", "state": "covered", "revisionId": "initial", "turnId": "turn-1"}),
+    );
+    assert_eq!(recorded, json!({"accepted": true}));
+    assert_eq!(session.checks["trace"].state, CheckState::Covered);
+    assert_eq!(
+        session.answer_tool("record_task_check", &json!({"checkId": "missing"})),
+        json!({"accepted": false})
+    );
+    let followup = session.answer_tool("request_targeted_followup", &json!({"checkId": "trace"}));
+    assert!(followup.get("supportRequestId").is_some(), "{followup}");
+    assert_eq!(
+        session.answer_tool("request_targeted_followup", &json!({"checkId": "nope"})),
+        json!({"error": "targeted follow-up unavailable"})
+    );
+    assert_eq!(
+        session.answer_tool("end_interview", &json!({})),
+        json!({"error": "tool unavailable in task mode"})
+    );
+    session.page_absent = true;
+    assert_eq!(
+        session.answer_tool("read_editor", &json!({})),
+        json!({"error": "the learner's page is not connected"})
+    );
+}
+
+fn capture(id: &str, revision: &str, code: &str, trigger: &str) -> RevisionMessage {
+    RevisionMessage {
+        version: 1,
+        request_id: id.to_owned(),
+        revision_id: revision.to_owned(),
+        code: code.to_owned(),
+        trigger: serde_json::from_value(json!(trigger)).unwrap(),
+    }
+}
+
+fn practice(id: &str, revision: &str, passed: u32, total: u32, diagnostics: &str) -> RunMessage {
+    RunMessage {
+        version: 1,
+        request_id: id.to_owned(),
+        run_id: id.to_owned(),
+        revision_id: revision.to_owned(),
+        passed,
+        total,
+        diagnostics: diagnostics.to_owned(),
+    }
+}
+
+async fn working() -> TaskSession {
+    let mut session = TaskSession::new(admitted().await, 100);
+    session.start(100);
+    session
+}
+
+#[tokio::test]
+async fn small_states_parse_and_report_exactly() {
+    assert_eq!(
+        Support::parse("targeted_followup"),
+        Some(Support::TargetedFollowup)
+    );
+    assert_eq!(
+        Support::parse("conceptual_hint"),
+        Some(Support::ConceptualHint)
+    );
+    assert_eq!(Support::parse("none"), Some(Support::None));
+    assert_eq!(Support::parse("hint"), None);
+    let mut session = working().await;
+    assert!(session.turns.is_empty());
+    session.observe_turn("turn-1", "I traced the state.", 101);
+    assert!(!session.turns.is_empty());
+    session
+        .record_check("trace", "unresolved", "initial", "turn-1")
+        .unwrap();
+    assert_eq!(session.checks["trace"].state, CheckState::Unresolved);
+    assert!(
+        session
+            .record_check("trace", "open", "initial", "turn-1")
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn an_attempt_that_ended_before_start_never_starts() {
+    let mut session = TaskSession::new(admitted().await, 100);
+    session.conclude(Cause::Reload, 0, 100);
+    session.start(101);
+    assert_eq!(session.phase, Phase::Feedback);
+    assert_eq!(session.deadline_at, None);
+}
+
+#[tokio::test]
+async fn the_interviewer_state_is_published_only_when_it_changes() {
+    let mut session = working().await;
+    let seq = session.seq();
+    session.availability(Interviewer::Available);
+    assert_eq!(session.seq(), seq);
+    session.availability(Interviewer::Degraded);
+    assert_eq!(session.interviewer, Interviewer::Degraded);
+    assert_eq!(session.seq(), seq + 1);
+    session.availability(Interviewer::Unavailable);
+    assert_eq!(session.seq(), seq + 2);
+}
+
+#[tokio::test]
+async fn an_edit_is_held_to_the_byte_limit_and_to_its_own_id() {
+    let mut session = working().await;
+    let at_limit = "x".repeat(MAX_CODE_BYTES);
+    session.acknowledge_edit("big", &at_limit, 101).unwrap();
+    assert!(
+        session
+            .acknowledge_edit("bigger", &format!("{at_limit}x"), 102)
+            .is_err()
+    );
+    // A captured revision's id cannot later name other code, even once it is
+    // no longer the current one.
+    session
+        .revision(capture("c1", "kept", "first", "discuss"), 103)
+        .unwrap();
+    session
+        .acknowledge_edit("later", "something else", 104)
+        .unwrap();
+    assert!(session.acknowledge_edit("kept", "different", 105).is_err());
+    session.acknowledge_edit("kept", "first", 106).unwrap();
+}
+
+#[tokio::test]
+async fn a_practice_capture_is_pending_until_exactly_its_expiry() {
+    let mut session = working().await;
+    let window = default_number("runCaptureSeconds");
+    session
+        .revision(capture("c1", "run-1", "a", "run"), 100)
+        .unwrap();
+    // Another run's capture waits while this one is pending...
+    assert!(
+        session
+            .revision(capture("c2", "run-2", "b", "run"), 100 + window - 1)
+            .is_err()
+    );
+    // ...a Discuss capture does not, nor a repeat of the same revision...
+    session
+        .revision(capture("c3", "talk", "c", "discuss"), 100 + window - 1)
+        .unwrap();
+    session
+        .acknowledge_edit("run-1", "a", 100 + window - 1)
+        .unwrap();
+    session
+        .revision(capture("c4", "run-1", "a", "run"), 100 + window - 1)
+        .unwrap();
+    // ...and once it expires the next run may capture.
+    session
+        .revision(capture("c5", "run-3", "d", "run"), 100 + 2 * window - 1)
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_practice_run_report_is_checked_field_by_field() {
+    let mut session = working().await;
+    session
+        .revision(capture("c1", "run-1", "a", "run"), 101)
+        .unwrap();
+    for (name, run) in [
+        ("more passed than ran", practice("r1", "run-1", 3, 2, "")),
+        (
+            "a runner failure says why",
+            practice("r2", "run-1", 0, 0, "  "),
+        ),
+        (
+            "diagnostics too long",
+            practice("r3", "run-1", 0, 0, &"x".repeat(4097)),
+        ),
+        ("an unknown revision", practice("r4", "elsewhere", 1, 2, "")),
+    ] {
+        assert!(session.run(run, 102).is_err(), "{name}");
+    }
+    let mut bad_id = practice("r5", "run-1", 1, 2, "");
+    bad_id.run_id = "not an id".to_owned();
+    assert!(session.run(bad_id, 102).is_err());
+    let seq = session.seq();
+    // All passing is a run like any other.
+    session.run(practice("r6", "run-1", 2, 2, ""), 102).unwrap();
+    assert!(session.seq() > seq);
+    assert!(session.runs.contains_key("r6"));
+}
+
+#[tokio::test]
+async fn the_last_run_summary_slot_is_kept_and_the_next_overflows() {
+    let mut session = working().await;
+    let limit = default_number("publicRunSummaries") as usize;
+    // One revision run again and again, so only the run summaries fill.
+    for index in 0..=limit {
+        session
+            .revision(capture(&format!("c{index}"), "run-1", "same", "run"), 101)
+            .unwrap();
+        session
+            .run(practice(&format!("r{index}"), "run-1", 1, 2, ""), 101)
+            .unwrap();
+        assert_eq!(
+            session.capture_overflow,
+            index >= limit,
+            "after run {index}"
+        );
+    }
+    assert_eq!(session.runs.len(), limit);
+}
+
+#[tokio::test]
+async fn turns_are_bounded_by_id_size_and_count() {
+    let mut session = working().await;
+    session.observe_turn("bad id", "words", 101);
+    assert!(session.capture_overflow);
+    let mut session = working().await;
+    session.observe_turn("long", &"x".repeat(MAX_TURN_BYTES + 1), 101);
+    assert!(session.capture_overflow && session.turns.is_empty());
+    let mut session = working().await;
+    session.observe_turn("edge", &"x".repeat(MAX_TURN_BYTES), 101);
+    for index in 1..MAX_TURNS {
+        session.observe_turn(&format!("turn-{index}"), "words", 101);
+    }
+    assert_eq!(session.turns.len(), MAX_TURNS);
+    assert!(!session.capture_overflow);
+    session.observe_turn("one-more", "words", 101);
+    assert!(session.capture_overflow);
+    assert_eq!(session.turns.len(), MAX_TURNS);
+}
+
+#[tokio::test]
+async fn nothing_but_wrap_up_follows_a_finish() {
+    let mut session = working().await;
+    session
+        .action(action("f", "finish", Some("initial")), 101)
+        .unwrap();
+    assert_eq!(session.phase, Phase::WrapUp);
+    assert!(session.action(action("h", "hint", None), 102).is_err());
+    assert!(
+        session
+            .action(action("d", "discuss", Some("initial")), 102)
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn a_nudge_waits_for_exactly_the_idle_time() {
+    let mut session = working().await;
+    let idle = default_number("nudgeIdleSeconds");
+    assert!(session.tick(100 + idle - 1, false, false).is_none());
+    assert!(session.tick(100 + idle, false, false).is_some());
+    // Thinking or speaking holds it, even when it is due.
+    let mut quiet = working().await;
+    assert!(quiet.tick(100 + idle, true, false).is_none());
+    assert!(quiet.tick(100 + idle, false, true).is_none());
+}
+
+#[tokio::test]
+async fn wrap_up_begins_at_its_lead_time_and_is_published() {
+    let mut session = working().await;
+    let deadline = session.deadline_at.unwrap();
+    let lead = default_number("wrapUpSeconds");
+    assert!(
+        !session.wrap_up_open(deadline - lead - 1),
+        "not during work"
+    );
+    session.tick(deadline - lead - 1, false, false);
+    assert_eq!(session.phase, Phase::Work);
+    let seq = session.seq();
+    assert!(session.tick(deadline - lead, false, false).is_some());
+    assert_eq!(session.phase, Phase::WrapUp);
+    assert_eq!(session.seq(), seq + 1);
+    // Each open check is asked once; then none are left.
+    let mut asked = std::collections::HashSet::new();
+    while let Some(id) = session.next_wrap_up_check() {
+        assert!(asked.insert(id));
+    }
+    assert!(!asked.is_empty());
+    session.feedback(deadline - 1);
+    assert_eq!(session.phase, Phase::Feedback);
+    assert!(session.next_wrap_up_check().is_none());
+}
+
+#[tokio::test]
+async fn a_page_ending_needs_version_one_and_a_request_id() {
+    for (version, id) in [(2, "e1"), (1, "not an id")] {
+        let mut session = working().await;
+        let mut message = end("e1", "invalid", "visibility");
+        message.version = version;
+        message.request_id = id.to_owned();
+        assert!(session.end(message, 101).is_err(), "{version} {id}");
+        assert_eq!(session.phase, Phase::Work);
     }
 }

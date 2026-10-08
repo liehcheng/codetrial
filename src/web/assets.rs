@@ -193,7 +193,9 @@ fn static_candidates(path: &str) -> Option<Vec<String>> {
         .collect::<Vec<_>>()
         .join("/");
 
-    if super::tasks::task_page(&format!("/{clean}")).is_some() {
+    // Matched on the path as sent: the page reads its set and task from
+    // `location.pathname`, so a doubled slash it would misread is no task.
+    if super::tasks::task_page(path).is_some() {
         return Some(vec!["task.html".to_owned()]);
     }
 

@@ -93,11 +93,35 @@ struct State {
     unlocked: HashMap<(i64, Assignment), Unlocked>,
     unlock_order: VecDeque<(i64, Assignment)>,
     next_claim_id: u64,
-    active_accounts: HashMap<i64, u64>,
+    /// The one attempt this process runs, whoever's it is: one CodeTrial
+    /// serves one learner, and keeps one result.
+    active: Option<ActiveAttempt>,
     ordinals: HashMap<(i64, String), u64>,
     admissions: HashMap<(i64, String), PendingAdmission>,
     admission_order: VecDeque<(i64, String)>,
     result: Option<StoredResult>,
+}
+
+struct ActiveAttempt {
+    owner_id: i64,
+    claim_id: u64,
+    /// The room its admission answered with, once it has.
+    room: Option<String>,
+}
+
+impl State {
+    /// Drops a kept result once its time is up, at whatever request comes
+    /// next, so an expired review and its code are not held for the life of
+    /// the process.
+    fn purge(&mut self, now: u64) {
+        if self
+            .result
+            .as_ref()
+            .is_some_and(|result| result.expires_at <= now)
+        {
+            self.result = None;
+        }
+    }
 }
 
 struct Unlocked {
@@ -178,7 +202,6 @@ struct PendingAdmission {
 
 struct AdmissionLease {
     inner: Weak<Inner>,
-    owner_id: i64,
     claim_id: u64,
 }
 
@@ -186,8 +209,12 @@ impl Drop for AdmissionLease {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.upgrade() {
             let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.active_accounts.get(&self.owner_id) == Some(&self.claim_id) {
-                state.active_accounts.remove(&self.owner_id);
+            if state
+                .active
+                .as_ref()
+                .is_some_and(|active| active.claim_id == self.claim_id)
+            {
+                state.active = None;
             }
         }
     }
@@ -345,6 +372,7 @@ impl TaskService {
             return Err(AccessError::new("client_override"));
         }
         let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.purge(now);
         let key = (owner_id, request_key.to_owned());
         let named = (assignment.clone(), task_id.to_owned());
         if let Some(admission) = state.admissions.get(&key) {
@@ -352,7 +380,10 @@ impl TaskService {
                 return Err(AccessError::new("client_override"));
             }
             if admission.expires_at <= now
-                || state.active_accounts.get(&owner_id) != Some(&admission.claim_id)
+                || state
+                    .active
+                    .as_ref()
+                    .is_none_or(|active| active.claim_id != admission.claim_id)
             {
                 return Err(AccessError::new("request_key_expired"));
             }
@@ -365,7 +396,7 @@ impl TaskService {
                     retry_after: Some(1),
                 });
         }
-        if state.active_accounts.contains_key(&owner_id) {
+        if state.active.is_some() {
             return Err(AccessError::new("active_task_session"));
         }
         let unlocked = state
@@ -389,7 +420,11 @@ impl TaskService {
             .or_default();
         *ordinal += 1;
         let session_ordinal = *ordinal;
-        state.active_accounts.insert(owner_id, claim_id);
+        state.active = Some(ActiveAttempt {
+            owner_id,
+            claim_id,
+            room: None,
+        });
         state.admissions.insert(
             key.clone(),
             PendingAdmission {
@@ -418,7 +453,6 @@ impl TaskService {
             preparation,
             admission_lease: Arc::new(AdmissionLease {
                 inner: Arc::downgrade(&self.0),
-                owner_id,
                 claim_id,
             }),
         }))
@@ -444,6 +478,13 @@ impl TaskService {
         }
         match response {
             Some(response) => {
+                if let Some(active) = state
+                    .active
+                    .as_mut()
+                    .filter(|active| active.claim_id == claim_id)
+                {
+                    active.room = response["roomName"].as_str().map(str::to_owned);
+                }
                 if let Some(admission) = state.admissions.get_mut(&key) {
                     admission.response = Some(response);
                 }
@@ -458,18 +499,20 @@ impl TaskService {
     /// The result of the account's attempt in `room`.
     pub fn result(&self, owner_id: i64, room: &str, now: u64) -> ResultLookup {
         let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state
-            .result
-            .as_ref()
-            .is_some_and(|result| result.expires_at <= now)
-        {
-            state.result = None;
-        }
+        state.purge(now);
         match &state.result {
             Some(result) if result.owner_id == owner_id && result.room == room => {
                 ResultLookup::Ready(result.value.clone())
             }
-            _ if state.active_accounts.contains_key(&owner_id) => ResultLookup::Pending,
+
+            // Pending only for the attempt still running in that very room: a
+            // stale or wrong room id gets no result now or later.
+            _ if state.active.as_ref().is_some_and(|active| {
+                active.owner_id == owner_id && active.room.as_deref() == Some(room)
+            }) =>
+            {
+                ResultLookup::Pending
+            }
             _ => ResultLookup::Unavailable,
         }
     }

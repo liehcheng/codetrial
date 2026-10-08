@@ -516,3 +516,58 @@ async fn a_task_is_refused_at_load_when_no_interviewer_can_join() {
     server.shutdown().await;
     remove_database(db).await;
 }
+
+#[tokio::test]
+async fn a_malformed_assignment_query_is_refused_in_the_task_error_shape() {
+    let (mut config, cookie, db) = signed_in_web_config("task-bad-query");
+    config.tasks = Some(unlocked_for(1).await);
+    let (url, server) = spawn_task_server(config).await;
+    for query in [
+        "",
+        "?site=https%3A%2F%2Fteacher.github.io%2Fcourse",
+        "?version=7&site=x&version=x",
+    ] {
+        let response = http_client()
+            .get(format!(
+                "{url}/api/task-sets/classroom/tasks/delimiter-closer{query}"
+            ))
+            .header("Cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            code(response).await,
+            (400, "site_invalid".to_owned()),
+            "{query}"
+        );
+    }
+    server.shutdown().await;
+    remove_database(db).await;
+}
+
+#[tokio::test]
+async fn only_the_canonical_assignment_path_is_a_task_page() {
+    let (config, _, db) = signed_in_web_config("task-page-path");
+    let (url, server) = spawn_web_server(config).await;
+    let client = http_client();
+    let page = client
+        .get(format!("{url}/t/classroom/delimiter-closer"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    assert!(page.text().await.unwrap().contains("task.js"));
+    // The page reads its set and task from the path as sent, so a doubled
+    // slash it would misread is not served as the task page.
+    let doubled = client
+        .get(format!("{url}/t//classroom/delimiter-closer"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!doubled.contains("task.js"), "{doubled}");
+    server.shutdown().await;
+    remove_database(db).await;
+}

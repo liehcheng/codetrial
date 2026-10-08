@@ -44,7 +44,7 @@ test("unknown review contracts and interview reports display feedback unavailabl
   }
 });
 
-test("an invalid or interrupted attempt displays without ratings", () => {
+test("an invalid or interrupted result is accepted for display as sent", () => {
   for (const outcome of ["invalid", "interrupted"]) {
     const value = {
       assessmentMode: "task",

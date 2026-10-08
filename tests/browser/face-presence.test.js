@@ -7,6 +7,7 @@ import {
   createFacePresenceDetector,
   createFacePresenceTracker,
   faceAssetUrl,
+  faceGeometry,
   facePresenceVerdict,
   normalizeFaceResults,
 } from "../../web/face-presence.js";
@@ -272,6 +273,51 @@ test("face normalization keeps the most confident face's box and keypoints", () 
   assert.deepEqual(result.face.box, [0.5, 0.4, 0.2, 0.3]);
   assert.equal(result.face.landmarks.length, 4);
   assert.ok(Math.abs(result.face.landmarks[2][1] - 0.4) < 1e-9);
+});
+
+test("face geometry is whole or absent, never shifted", () => {
+  const score = () => 1;
+  const box = { xCenter: 0.5, yCenter: 0.4, width: 0.2, height: 0.3 };
+  const points = [
+    { x: 0.45, y: 0.35 },
+    { x: 0.55, y: 0.35 },
+    { x: 0.5, y: 0.4 },
+    { x: 0.5, y: 0.46 },
+  ];
+  assert.equal(
+    faceGeometry([{ boundingBox: box, landmarks: points }], score).landmarks
+      .length,
+    4,
+  );
+  // One bad point would move the nose into the mouth's place if dropped; the
+  // set is refused instead and the measure falls back to the box.
+  const broken = [...points];
+  broken[1] = { x: 0.55, y: Number.NaN };
+  assert.deepEqual(
+    faceGeometry([{ boundingBox: box, landmarks: broken }], score).landmarks,
+    [],
+  );
+  for (const key of ["xCenter", "yCenter", "width", "height"])
+    assert.equal(
+      faceGeometry(
+        [{ boundingBox: { ...box, [key]: undefined }, landmarks: points }],
+        score,
+      ),
+      null,
+      key,
+    );
+});
+
+test("the worker measures faces with the same code as the page", () => {
+  const body = (file) => {
+    const source = readFileSync(new URL(file, import.meta.url), "utf8");
+    const start = source.indexOf("function faceGeometry(");
+    return source.slice(start, source.indexOf("\n}\n", start));
+  };
+  assert.equal(
+    body("../../web/face-worker.js"),
+    body("../../web/face-presence.js"),
+  );
 });
 
 // The preflight camera gate. It is mandatory, it has no bypass, and the two

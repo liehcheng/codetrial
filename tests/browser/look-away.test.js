@@ -175,3 +175,51 @@ test("a look-away resumed after a long gap counts only what was seen", () => {
   assert.equal(back.state, "warning");
   assert.ok(back.awayMs <= 5000, `${back.awayMs}`);
 });
+
+test("a face measured another way neither clears nor extends a look-away", () => {
+  const monitor = createLookAwayMonitor({
+    limit: 0.75,
+    metric: "keypoints",
+    thresholdMs: 8000,
+  });
+  const down = sample(0.95);
+  // The same face with no keypoints: only the box is measured.
+  const boxOnly = {
+    available: true,
+    count: 1,
+    face: { box: [0.5, 0.5, 0.2, 0.3] },
+  };
+  monitor.update(down, 0);
+  monitor.update(down, 1000);
+  const mismatched = monitor.update(boxOnly, 1500);
+  assert.notEqual(mismatched.state, "ok", "a box sample cleared the look-away");
+  assert.ok(mismatched.awayMs <= 1000, `${mismatched.awayMs}`);
+});
+
+test("calibration rests on samples measured one way, most of the phase", () => {
+  const box = {
+    available: true,
+    count: 1,
+    face: { box: [0.5, 0.5, 0.2, 0.3] },
+  };
+  // Two keypoint samples among eighteen box ones: the baseline is the box's,
+  // and it is measured over enough of the phase.
+  const mixed = [
+    sample(0.5),
+    sample(0.5),
+    ...Array.from({ length: 18 }, () => box),
+  ];
+  const typing = Array.from({ length: 20 }, () => box);
+  const result = calibrate(mixed, typing);
+  assert.equal(result.ok, true);
+  assert.equal(result.metric, "box");
+  // Split down the middle, neither way covers enough of the phase.
+  const split = [
+    ...Array.from({ length: 10 }, () => sample(0.5)),
+    ...Array.from({ length: 10 }, () => box),
+  ];
+  assert.deepEqual(calibrate(split, typing), {
+    ok: false,
+    reason: "face_not_steady",
+  });
+});

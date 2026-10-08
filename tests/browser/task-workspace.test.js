@@ -43,12 +43,12 @@ const task = {
   reviewDeliverySeconds: 300,
 };
 
-const result = (outcome, cause) => ({
+const result = (outcome, cause, taskId = "delimiter-closer") => ({
   assessmentMode: "task",
   taskContract: { package: 1, prompt: 1, wire: 1, reportSchema: 1, rubric: 1 },
   taskAssessment: {
     setId: "classroom",
-    taskId: "delimiter-closer",
+    taskId,
     outcome: { outcome, cause, at: 75, durationMs: 0 },
     finalRevisionId: "rev-final",
     finalCode: "print('frozen work')\n",
@@ -79,6 +79,7 @@ export class Room {
    if (options.topic === "task_start" && h.rejectStartSend) { throw new Error("Start publish failed"); }
    if (options.topic === "task_connected" && globalThis.loseTaskAfterReady) { h.publish(); h.disconnect(); return; }
    if (options.topic === "task_end" && h.failNextEnd) { h.failNextEnd = false; h.messages.pop(); throw new Error("data channel closed"); }
+   if (options.topic === "task_start" && h.hangStart) return new Promise(() => {});
    if (options.topic === "task_start" && h.holdStart) { h.holdStart = false; h.releaseStart = () => { h.state.phase = "work"; h.state.deadlineAt = new Date(Date.now() + 900000).toISOString(); h.publish(); }; return; }
    if (options.topic === "task_start") { h.state.phase = "work"; h.state.deadlineAt = new Date(Date.now() + 900000).toISOString(); }
    if (options.topic === "task_end") { h.state.phase = "feedback"; h.state.outcome = {outcome: message.outcome, cause: message.cause, at: 75, durationMs: message.durationMs}; }
@@ -1113,7 +1114,7 @@ test("assignment Setup requires the Google key before saving", async (t) => {
 
 test("changed task and expired polling budget still recover a retained result", async (t) => {
   const ctx = await pageFor(t, {
-    completedReview: result("interrupted", "reload"),
+    completedReview: result("interrupted", "reload", "second-task"),
   });
   if (!ctx) return;
   const { page, admissions, reviewRequests } = ctx;
@@ -1123,10 +1124,13 @@ test("changed task and expired polling budget still recover a retained result", 
     await prepare(page, true);
     await page.click("#start");
     await page.waitForFunction(() => !document.getElementById("code").disabled);
-    await page.evaluate(() => {
+    // Expired as the reloaded page starts, after the old page's `pagehide`
+    // has written the record on its way out.
+    await page.addInitScript(() => {
       const key = Object.keys(sessionStorage).find((key) =>
         key.startsWith("codetrial-task-result:"),
       );
+      if (!key) return;
       const saved = JSON.parse(sessionStorage.getItem(key));
       saved.until = Date.now() - 1000;
       sessionStorage.setItem(key, JSON.stringify(saved));
@@ -1134,7 +1138,15 @@ test("changed task and expired polling budget still recover a retained result", 
     await page.reload();
     await page.locator("#review").waitFor({ state: "visible" });
     assert.equal(admissions.length, 1);
+    assert.equal(admissions[0].taskId, "second-task");
     assert.deepEqual(reviewRequests, ["/api/task-reviews/room-1"]);
+    // The task picked before Start is the one recovered after the reload.
+    const download = page.waitForEvent("download");
+    await page.click("#export-review");
+    const exported = JSON.parse(
+      await readFile(await (await download).path(), "utf8"),
+    );
+    assert.equal(exported.taskAssessment.taskId, "second-task");
   } finally {
     await page.close();
   }
@@ -1174,10 +1186,13 @@ test("a restored telemetry gap does not offer an empty code download", async (t)
   const { page } = ctx;
   try {
     await start(page);
-    await page.evaluate(() => {
+    // Expired as the reloaded page starts: the old page's `pagehide` writes
+    // the record again on its way out, as a real reload would.
+    await page.addInitScript(() => {
       const key = Object.keys(sessionStorage).find((key) =>
         key.startsWith("codetrial-task-result:"),
       );
+      if (!key) return;
       const saved = JSON.parse(sessionStorage.getItem(key));
       saved.until = Date.now() - 1000;
       sessionStorage.setItem(key, JSON.stringify(saved));
@@ -1754,5 +1769,83 @@ test("terminal cleanup stops the separately published microphone once", async (t
         await page.close();
       }
     });
+  }
+});
+
+test("the camera recovery button asks for the devices again", async (t) => {
+  const ctx = await pageFor(t);
+  if (!ctx) return;
+  const { page } = ctx;
+  try {
+    await unlock(page);
+    await page.check("#acknowledge");
+    await page.evaluate(() => {
+      globalThis.grant = navigator.mediaDevices.getUserMedia;
+      navigator.mediaDevices.getUserMedia = async () => {
+        throw new Error("NotAllowedError");
+      };
+    });
+    await page.click("#devices");
+    await page.locator("#recovery").waitFor({ state: "visible" });
+    assert.match(await page.locator("#recovery").textContent(), /microphone/i);
+    await page.evaluate(() => {
+      navigator.mediaDevices.getUserMedia = globalThis.grant;
+    });
+    await page.click("#recovery");
+    await page.waitForFunction(
+      () => !document.getElementById("calibrate").disabled,
+    );
+  } finally {
+    await page.close();
+  }
+});
+
+test("an attempt that ends early is collected within the delivery window", async (t) => {
+  const ctx = await pageFor(t);
+  if (!ctx) return;
+  const { page } = ctx;
+  try {
+    await start(page);
+    const saved = () =>
+      page.evaluate(() => {
+        const key = Object.keys(sessionStorage).find((key) =>
+          key.startsWith("codetrial-task-result:"),
+        );
+        return JSON.parse(sessionStorage.getItem(key)).until - Date.now();
+      });
+    // At Start the window covers the whole task and then the delivery.
+    assert.ok((await saved()) > 900000);
+    await page.evaluate(() => document.exitFullscreen());
+    // Ended early, it is the delivery window alone.
+    assert.ok((await saved()) <= 300000, `${await saved()}`);
+  } finally {
+    await page.close();
+  }
+});
+
+test("a reload while Start is on its way keeps the way back to the result", async (t) => {
+  const ctx = await pageFor(t);
+  if (!ctx) return;
+  const { page } = ctx;
+  try {
+    await prepare(page);
+    await page.evaluate(() => {
+      globalThis.taskHarness.hangStart = true;
+    });
+    await page.click("#start");
+    await page.waitForFunction(() =>
+      globalThis.taskHarness.messages.some((row) => row.topic === "task_start"),
+    );
+    const recorded = () =>
+      page.evaluate(() =>
+        Object.keys(sessionStorage).some((key) =>
+          key.startsWith("codetrial-task-result:"),
+        ),
+      );
+    assert.equal(await recorded(), false);
+    await page.evaluate(() => window.dispatchEvent(new Event("pagehide")));
+    assert.equal(await recorded(), true);
+  } finally {
+    await page.close();
   }
 });
