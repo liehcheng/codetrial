@@ -424,23 +424,24 @@ fn one_task_may_not_outgrow_its_byte_limit() {
         .unwrap()
         .len()
     };
+
+    // Padded in a judge case's input, which no text bound limits, so the record
+    // stays valid and the byte limit is the only rule in play.
+    let cases = padded["judges"][&id]["cases"].as_array_mut().unwrap();
+    let mut case = cases[0].clone();
+    case["label"] = json!("padding");
+    case["input"] = json!([""]);
+    cases.push(case);
+    let pad = |value: &mut Value, size: usize| {
+        let cases = value["judges"][&id]["cases"].as_array_mut().unwrap();
+        cases.last_mut().unwrap()["input"] = json!(["x".repeat(size)]);
+    };
     // Exactly at the limit is still a task; one byte more is not.
     let room = limit - row_bytes(&padded);
-    padded["problems"][0]["topics"][0] = json!(format!(
-        "{}{}",
-        padded["problems"][0]["topics"][0].as_str().unwrap(),
-        "x".repeat(room)
-    ));
+    pad(&mut padded, room);
     assert_eq!(row_bytes(&padded), limit);
-    assert!(
-        decoded(&padded)
-            .err()
-            .is_none_or(|error| error.0 != "plaintext task exceeds limit")
-    );
-    padded["problems"][0]["topics"][0] = json!(format!(
-        "{}x",
-        padded["problems"][0]["topics"][0].as_str().unwrap()
-    ));
+    assert!(decoded(&padded).is_ok());
+    pad(&mut padded, room + 1);
     assert_eq!(
         decoded(&padded).err().unwrap().0,
         "plaintext task exceeds limit"
