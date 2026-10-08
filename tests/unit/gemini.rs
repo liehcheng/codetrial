@@ -61,10 +61,19 @@ async fn a_rejected_task_review_is_asked_for_again_with_the_repair_note() {
     session.start(100);
     let dimension = json!({"rating": null, "reason": "No reliable opportunity was captured.",
         "insufficientReason": "missing_turns", "support": "none", "evidence": []});
-    let review = json!({"dimensions": crate::tasks::report::DIMENSIONS
-        .into_iter()
-        .map(|name| (name.to_owned(), dimension.clone()))
-        .collect::<serde_json::Map<_, _>>(),
+
+    // Named here rather than read from the validator, which is what is being
+    // exercised.
+    let dimensions: serde_json::Map<_, _> = [
+        "reasoningParticipation",
+        "implementationOwnership",
+        "testingAndDiagnosis",
+        "revisionAndImprovement",
+    ]
+    .into_iter()
+    .map(|name| (name.to_owned(), dimension.clone()))
+    .collect();
+    let review = json!({"dimensions": dimensions,
         "gaps": [], "nextActions": ["Trace a boundary input and explain the state."]});
     let answers = Arc::new(std::sync::Mutex::new(vec![
         review.to_string(),
