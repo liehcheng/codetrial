@@ -582,22 +582,28 @@ async fn only_the_canonical_assignment_path_is_a_task_page() {
     remove_database(db).await;
 }
 
-/// GitHub's half of the device flow: one device code, and each poll answered
-/// with the next of `answers`. The profile endpoint answers only the token a
-/// poll issued, so a sign-in that never polled cannot pass.
-async fn spawn_device_github(answers: Vec<Value>) -> (String, TestServer) {
+/// GitHub's half of the device flow: a new device code for each start, and
+/// each poll answered with the next of `answers`, which names the code it
+/// expects. The profile endpoint answers only the token a poll issued, so a
+/// sign-in that never polled cannot pass.
+async fn spawn_device_github(answers: Vec<(&'static str, Value)>) -> (String, TestServer) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let answers = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
         answers,
     )));
+    let issued = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let router = axum::Router::new()
         .route(
             "/login/device/code",
-            axum::routing::post(|| async {
-                axum::Json(json!({"device_code": "device-1", "user_code": "ABCD-1234",
-                    "verification_uri": "https://github.com/login/device", "interval": 5,
-                    "expires_in": 900}))
+            axum::routing::post(move || {
+                let code = issued.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                async move {
+                    axum::Json(json!({"device_code": format!("device-{code}"),
+                        "user_code": "ABCD-1234",
+                        "verification_uri": "https://github.com/login/device", "interval": 5,
+                        "expires_in": 900}))
+                }
             }),
         )
         .route(
@@ -606,13 +612,14 @@ async fn spawn_device_github(answers: Vec<Value>) -> (String, TestServer) {
                 let answers = answers.clone();
                 async move {
                     let posted: Value = serde_json::from_str(&body).unwrap();
-                    assert_eq!(posted["device_code"], "device-1");
+                    let (code, answer) = answers.lock().unwrap().pop_front().unwrap();
+                    assert_eq!(posted["device_code"], code);
                     assert_eq!(posted["client_id"], "public-client-id");
                     assert_eq!(
                         posted["grant_type"],
                         "urn:ietf:params:oauth:grant-type:device_code"
                     );
-                    axum::Json(answers.lock().unwrap().pop_front().unwrap())
+                    axum::Json(answer)
                 }
             }),
         )
@@ -642,10 +649,10 @@ async fn spawn_device_github(answers: Vec<Value>) -> (String, TestServer) {
 #[tokio::test]
 async fn a_device_sign_in_waits_while_pending_and_signs_in_once_approved() {
     let (github, github_server) = spawn_device_github(vec![
-        json!({"error": "authorization_pending"}),
-        json!({"error": "slow_down", "interval": 15}),
-        json!({"error": "access_denied"}),
-        json!({"access_token": "device-token"}),
+        ("device-1", json!({"error": "authorization_pending"})),
+        ("device-1", json!({"error": "slow_down", "interval": 15})),
+        ("device-1", json!({"error": "access_denied"})),
+        ("device-2", json!({"access_token": "device-token"})),
     ])
     .await;
     let (mut config, _, db) = signed_in_web_config("task-device-poll");
@@ -670,19 +677,23 @@ async fn a_device_sign_in_waits_while_pending_and_signs_in_once_approved() {
     assert_eq!(orphan.status(), 400);
     assert_eq!(orphan.json::<Value>().await.unwrap()["restart"], true);
 
-    let start = post("/api/github/device", None).send().await.unwrap();
-    assert_eq!(start.status(), 200);
-    let device = start.headers()["set-cookie"]
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_owned();
-    let shown = start.json::<Value>().await.unwrap();
-    assert_eq!(shown["userCode"], "ABCD-1234");
+    let start = || async {
+        let start = post("/api/github/device", None).send().await.unwrap();
+        assert_eq!(start.status(), 200);
+        let device = start.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let shown = start.json::<Value>().await.unwrap();
+        assert_eq!(shown["userCode"], "ABCD-1234");
+        device
+    };
+    let device = start().await;
 
-    let poll = || async {
+    let poll = |device: String| async move {
         let response = post("/api/github/device/poll", Some(&device))
             .send()
             .await
@@ -696,17 +707,19 @@ async fn a_device_sign_in_waits_while_pending_and_signs_in_once_approved() {
             .collect();
         (status, response.json::<Value>().await.unwrap(), cookies)
     };
-    let (status, body, _) = poll().await;
+    let (status, body, _) = poll(device.clone()).await;
     assert_eq!((status, body), (202, json!({"pending": true})));
-    let (status, body, _) = poll().await;
+    let (status, body, _) = poll(device.clone()).await;
     assert_eq!(
         (status, body),
         (202, json!({"pending": true, "interval": 15}))
     );
-    let (status, body, _) = poll().await;
+    // A declined code is finished with: the page starts a new one.
+    let (status, body, _) = poll(device.clone()).await;
     assert_eq!(status, 400);
     assert_eq!(body["restart"], true);
-    let (status, body, cookies) = poll().await;
+    let device = start().await;
+    let (status, body, cookies) = poll(device.clone()).await;
     assert_eq!((status, body), (200, json!({"signedIn": true})));
     let session = cookies
         .iter()
