@@ -98,7 +98,7 @@ async fn a_page_that_left_is_never_finalized_as_completed() {
         PageLoss::Interrupted
     );
     // A deadline passing while it is gone is the session's: `expire` knows.
-    session.page_absent = true;
+    session.page_left();
     let deadline = session.deadline_at.unwrap();
     session.tick(deadline, false, false);
     assert_eq!(session.outcome.unwrap().outcome, OutcomeKind::Interrupted);

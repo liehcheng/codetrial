@@ -312,8 +312,9 @@
 # `on_gemini_event` and `on_turn_complete` were already matched by the entries
 # above. What these handlers decide is not excluded: it was moved out of the
 # room so `cargo test` reaches it, into `TaskSession::receive` and
-# `TaskSession::answer_tool` (every page message and tool call), `page_loss`,
-# `wrap_up_due` and `speaking`, each tested in tests/unit.
+# `TaskSession::answer_tool` (every page message and tool call),
+# `TaskSession::page_left` and `page_returned` (the page leaving and joining),
+# `page_loss`, `wrap_up_due` and `speaking`, each tested in tests/unit.
 #
 # Keep this list short and each entry justified. An entry that is really "we
 # never got around to testing this" belongs in a test, not here.

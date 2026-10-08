@@ -373,8 +373,7 @@ impl TaskRoom<'_> {
                 if participant.identity().0 == self.candidate =>
             {
                 self.disconnected_at = None;
-                self.session.page_absent = false;
-                if self.session.phase != Phase::Ready {
+                if self.session.page_returned() {
                     self.alive = false;
                     self.recovery.allow_immediate(Instant::now());
                 }
@@ -384,7 +383,7 @@ impl TaskRoom<'_> {
                 if participant.identity().0 == self.candidate =>
             {
                 self.disconnected_at = Some(Instant::now());
-                self.session.page_absent = true;
+                self.session.page_left();
                 silence_output(&mut self.output, &mut self.media);
                 self.suppress_output = true;
             }
@@ -878,7 +877,9 @@ pub(crate) async fn run(
         .remote_participants()
         .values()
         .any(|participant| participant.identity().0 == candidate);
-    session.page_absent = !connected;
+    if !connected {
+        session.page_left();
+    }
     let mut state = TaskRoom {
         config,
         room,

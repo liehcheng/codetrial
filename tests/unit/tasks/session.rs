@@ -804,7 +804,7 @@ async fn a_deadline_reached_while_the_page_is_gone_interrupts_rather_than_comple
     let mut session = TaskSession::new(admitted().await, 100);
     session.start(100);
     let deadline = session.deadline_at.unwrap();
-    session.page_absent = true;
+    session.page_left();
     // Whichever path notices the deadline first: an edit, a turn, a tick.
     assert!(session.acknowledge_edit("late", "code", deadline).is_err());
     let outcome = session.outcome.unwrap();
@@ -1653,4 +1653,17 @@ async fn no_wrap_up_question_is_asked_during_work() {
     let mut session = working().await;
     assert_eq!(session.phase, Phase::Work);
     assert_eq!(session.next_wrap_up_check(), None);
+}
+
+#[tokio::test]
+async fn a_returning_page_restarts_the_interviewer_only_after_start() {
+    let mut session = TaskSession::new(admitted().await, 100);
+    session.page_left();
+    assert!(!session.page_present());
+    assert!(!session.page_returned());
+    assert!(session.page_present());
+    session.start(100);
+    session.page_left();
+    assert!(session.page_returned());
+    assert!(session.page_present());
 }

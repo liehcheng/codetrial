@@ -1026,6 +1026,20 @@ impl TaskSession {
         !self.page_absent
     }
 
+    /// The learner's page left the room. Until it returns, a deadline that
+    /// passes interrupts the attempt rather than completing it.
+    pub fn page_left(&mut self) {
+        self.page_absent = true;
+    }
+
+    /// The learner's page is back. True once the attempt has started, when the
+    /// room restarts its interviewer for the returned page; before Start the
+    /// first connection still stands.
+    pub fn page_returned(&mut self) -> bool {
+        self.page_absent = false;
+        self.phase != Phase::Ready
+    }
+
     /// Whether the attempt ended invalid or interrupted, which no model turn
     /// follows.
     pub fn ended_short(&self) -> bool {
